@@ -1,8 +1,11 @@
 """Verify Streamlit recording state without models or microphone access."""
 
 from io import BytesIO
+import json
 from pathlib import Path
 import re
+from threading import Event
+from time import monotonic, sleep
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -37,10 +40,14 @@ def wav_bytes():
 class FakeTranslationSession:
     """Controllable translation results without credentials, threads, or HTTP."""
 
-    def __init__(self, translate=None, *, failure_message=None):
+    def __init__(self, translate=None, *, failure_message=None, glossary=None,
+                 source_lang="zh-TW+en", target_lang="en", initial_results=None,
+                 initial_errors=None):
         self.translate = translate
         self.failure_message = failure_message
         self.provider = "Tencent" if translate is not None else "English"
+        self.initial_results = initial_results
+        self.initial_errors = initial_errors or []
         self.sources = []
         self.translations = []
         self.errors = []
@@ -50,9 +57,13 @@ class FakeTranslationSession:
 
     def _submit(self, texts):
         for text in texts[len(self.sources):]:
+            index = len(self.sources)
             self.sources.append(text)
-            self.translations.append(f"{self.provider} segment {len(self.sources)}.")
-            self.errors.append(None)
+            self.translations.append(
+                self.initial_results[index] if self.initial_results is not None and index < len(self.initial_results)
+                else f"{self.provider} segment {len(self.sources)}."
+            )
+            self.errors.append(self.initial_errors[index] if index < len(self.initial_errors) else None)
 
     def _retry_failed(self):
         self.errors = [None for _ in self.errors]
@@ -72,6 +83,7 @@ class RecordingAppTests(unittest.TestCase):
     def setUp(self):
         st.cache_resource.clear()
         self.addCleanup(st.cache_resource.clear)
+        self.start_patch("dotenv.load_dotenv", return_value=False)
         self.transcribe = Mock(return_value="A short transcript")
         self.vad = Mock(return_value=None)
         self.context = SimpleNamespace(
@@ -88,6 +100,19 @@ class RecordingAppTests(unittest.TestCase):
             "src.translation.TranslationSession",
             side_effect=FakeTranslationSession,
         )
+        self.correct = self.start_patch("src.reasoning.correct_translations", side_effect=lambda request: {
+            "corrections": [], "no_change": [
+                {"segment_id": row["segment_id"], "base_version": row["base_version"]}
+                for row in request["segments"]
+            ],
+        })
+        self.diarization = Mock()
+        self.diarization.snapshot.return_value = {
+            "status": "complete", "segments": [], "error": None, "pending": 0,
+        }
+        self.make_diarization = self.start_patch(
+            "src.diarization.DiarizationSession", return_value=self.diarization,
+        )
         self.app = AppTest.from_file(str(APP_FILE)).run()
         self.addCleanup(self.finish_current_recording)
         self.assertEqual(len(self.app.exception), 0)
@@ -97,6 +122,30 @@ class RecordingAppTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return patcher.start()
 
+    def configure_translations(self, *, openai=None, tencent=None, openai_errors=None, tencent_errors=None):
+        """Publish chosen fake outcomes on first submission, just like a real worker."""
+        self.translation_sessions = {}
+
+        def create(translate=None, **kwargs):
+            session = FakeTranslationSession(
+                translate, **kwargs,
+                initial_results=tencent if translate is not None else openai,
+                initial_errors=tencent_errors if translate is not None else openai_errors,
+            )
+            self.translation_sessions["tencent" if translate is not None else "openai"] = session
+            return session
+        self.make_translation.side_effect = create
+
+    def wait_for_corrections(self):
+        """Wait for the real scheduler with a mocked model, without rerunning the UI."""
+        deadline = monotonic() + 3
+        while monotonic() < deadline:
+            snapshot = self.app.session_state["slow_lane"].snapshot()
+            if snapshot["pending"] == 0:
+                return snapshot
+            sleep(0.005)
+        self.fail("The mocked correction worker did not drain.")
+
     def finish_current_recording(self):
         if "recording" in self.app.session_state:
             session = self.app.session_state["recording"]
@@ -104,6 +153,8 @@ class RecordingAppTests(unittest.TestCase):
             if session._worker.ident is not None:
                 session._worker.join(timeout=5)
             self.assertFalse(session._worker.is_alive())
+        if "slow_lane" in self.app.session_state:
+            self.app.session_state["slow_lane"].close()
 
     def start_recording(self):
         self.app.button(key="start_recording").click().run()
@@ -389,6 +440,9 @@ class RecordingAppTests(unittest.TestCase):
         tencent.close.assert_not_called()
 
     def test_each_original_segment_is_paired_with_both_provider_translations(self):
+        self.configure_translations(
+            openai=["Hello.", "Have you eaten?"], tencent=["Hi there.", "Did you eat?"],
+        )
         self.start_patch(
             "src.uploads.speech_segments",
             return_value=[np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32)],
@@ -398,8 +452,6 @@ class RecordingAppTests(unittest.TestCase):
         self.transcribe_file()
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        translation.translations = ["Hello.", "Have you eaten?"]
-        tencent.translations = ["Hi there.", "Did you eat?"]
         self.app.run()
 
         rows = re.findall(r"<li\b[^>]*>(.*?)</li>", self.transcript_html(), re.DOTALL)
@@ -416,6 +468,10 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(tencent.sources, ["你好。", "食飽未？"])
 
     def test_pending_and_failed_translations_keep_originals_and_allow_retry(self):
+        self.configure_translations(
+            openai=[None, None], openai_errors=[None, "Translation service unavailable"],
+            tencent=["First Tencent result.", "Second Tencent result."],
+        )
         self.start_patch(
             "src.uploads.speech_segments",
             return_value=[np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32)],
@@ -425,9 +481,6 @@ class RecordingAppTests(unittest.TestCase):
         self.transcribe_file()
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        translation.translations = [None, None]
-        translation.errors = [None, "Translation service unavailable"]
-        tencent.translations = ["First Tencent result.", "Second Tencent result."]
         self.app.run()
 
         self.assertIn("First original.", self.transcript_html())
@@ -452,6 +505,7 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(len(self.app.warning), 0)
 
     def test_tencent_failure_and_retry_do_not_block_or_repeat_openai_translation(self):
+        self.configure_translations(tencent=[None], tencent_errors=["Tencent translation unavailable"])
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
@@ -459,8 +513,6 @@ class RecordingAppTests(unittest.TestCase):
         self.transcribe_file()
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        tencent.translations = [None]
-        tencent.errors = ["Tencent translation unavailable"]
         self.app.run()
 
         self.assertIn("A short transcript", self.transcript_html())
@@ -600,6 +652,7 @@ class RecordingAppTests(unittest.TestCase):
     def test_translation_pending_failure_and_retry_do_not_change_breeze_score(self):
         from src.evaluation import word_match_score
 
+        self.configure_translations(openai=[None, None], tencent=["English segment 1.", "English segment 2."])
         self.start_patch(
             "src.uploads.speech_segments",
             return_value=[np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32)],
@@ -610,8 +663,6 @@ class RecordingAppTests(unittest.TestCase):
         self.evaluate_file()
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        translation.translations = [None, None]
-        tencent.translations = ["English segment 1.", "English segment 2."]
         self.app.run()
         expected_scores = {"Breeze · 1-wMER": "100.0%"}
         self.assertEqual(self.evaluation_scores(), expected_scores)
@@ -701,6 +752,7 @@ class RecordingAppTests(unittest.TestCase):
         score.assert_not_called()
 
     def test_source_reference_preview_and_score_use_spoken_text_without_leaking_reference(self):
+        self.configure_translations(openai=[None], tencent=[None])
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
@@ -728,9 +780,7 @@ class RecordingAppTests(unittest.TestCase):
         self.transcribe.assert_called_once()
         self.assertIsInstance(self.transcribe.call_args.args[0], np.ndarray)
 
-        translation.translations = [None]
         translation.errors = ["Translation unavailable"]
-        tencent.translations = [None]
         self.app.run()
         self.assertEqual(len(self.app.exception), 0)
         self.assertEqual(self.evaluation_scores(), expected)
@@ -991,6 +1041,224 @@ class RecordingAppTests(unittest.TestCase):
         self.assertTrue(self.app.selectbox(key="eval_reference_format").disabled)
         self.assertTrue(self.app.button(key="evaluate_file").disabled)
         self.assertNotIn("upload_job", self.app.session_state)
+
+    def test_correction_settings_are_frozen_per_session_and_pause_is_immediate(self):
+        settings = {
+            "slow_window_n": 6, "slow_horizon": 10, "slow_seal_timeout": 25,
+            "slow_request_timeout": 5, "slow_max_tokens": 8192,
+        }
+        for key, value in settings.items():
+            self.app.number_input(key=key).set_value(value)
+        self.app.slider(key="slow_confidence").set_value(0.7)
+        self.app.toggle(key="enable_diarization").set_value(False)
+        self.app.run()
+        self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+
+        self.assertEqual(lane.config.model, "gpt-6-astra")
+        self.assertEqual(lane.config.reasoning_effort, "medium")
+        self.assertEqual((lane.config.window_n, lane.config.revision_horizon_s), (6, 10))
+        self.assertEqual((lane.config.seal_timeout_s, lane.config.request_timeout_s), (25, 5))
+        self.assertEqual((lane.config.max_output_tokens, lane.config.confidence_threshold), (8192, 0.7))
+        for key in settings:
+            self.assertTrue(self.app.number_input(key=key).disabled)
+        self.assertTrue(self.app.toggle(key="enable_diarization").disabled)
+        self.assertFalse(self.make_diarization.call_args.kwargs["enabled"])
+
+        self.app.toggle(key="enable_corrections").set_value(False).run()
+        self.assertEqual(lane.snapshot()["status"], "paused")
+        self.app.button(key="stop_recording").click().run()
+        self.app.number_input(key="slow_window_n").set_value(2).run()
+        self.assertEqual(lane.config.window_n, 6)
+        self.start_recording()
+        replacement = self.app.session_state["slow_lane"]
+        self.assertIsNot(replacement, lane)
+        self.assertEqual(lane.snapshot()["status"], "closed")
+        self.assertEqual(replacement.config.window_n, 2)
+        self.assertFalse(replacement.config.enabled)
+        self.assertNotEqual(replacement.session_id, lane.session_id)
+
+    def test_fourth_lane_keeps_live_draft_when_late_correction_is_shown_in_final_view(self):
+        entered, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def correct(request):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("Test correction was not released.")
+            row = request["segments"][0]
+            return {"corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": "The reviewed English sentence.", "change_type": ["word_order"],
+                "confidence": 0.9, "rationale": "Preserve sentence order.", "term_pairs": [],
+            }], "no_change": []}
+
+        self.correct.side_effect = correct
+        self.app.number_input(key="slow_horizon").set_value(0).run()
+        self.start_patch("src.uploads.speech_segments", return_value=[{
+            "audio": np.zeros(1600, dtype=np.float32), "start_s": 0.0, "end_s": 0.1,
+        }])
+        self.select_wav()
+        self.transcribe_file()
+        self.assertTrue(entered.wait(1))
+        self.assertIn("Astra · Correction", self.transcript_html())
+        self.assertIn("English segment 1.", self.transcript_html())
+        self.assertIn(">Draft</span>", self.transcript_html())
+        self.app.selectbox(key="subtitle_view").select("Final record").run()
+        self.assertIn("Awaiting final text…", self.transcript_html())
+        self.assertNotIn("The reviewed English sentence.", self.transcript_html())
+
+        release.set()
+        final = self.wait_for_corrections()
+        self.app.run()
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertEqual(final["authoritative"], ["The reviewed English sentence."])
+        self.assertEqual(final["translations"], ["English segment 1."])
+        self.assertIn("Corrected · Final", self.transcript_html())
+        self.assertIn("The reviewed English sentence.", self.transcript_html())
+        self.assertFalse(self.app.download_button(key="download_final_srt").disabled)
+        self.app.selectbox(key="subtitle_view").select("Live subtitles").run()
+        self.assertIn("Draft · Final correction available", self.transcript_html())
+        self.assertNotIn("The reviewed English sentence.", self.transcript_html())
+        self.assertIn("A short transcript", self.transcript_html())
+        self.assertIn("Tencent segment 1.", self.transcript_html())
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.correct.call_count, 1)
+
+    def test_completed_fast_draft_is_rendered_and_reviewed_while_next_asr_is_blocked(self):
+        from src.ui import render_transcript
+
+        second_started, release, rendered_while_blocked = Event(), Event(), Event()
+        interrupted = False
+        self.addCleanup(release.set)
+        self.configure_translations(openai=[None, None])
+        self.start_patch("src.uploads.speech_segments", return_value=[
+            np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32),
+        ])
+
+        def transcribe(audio):
+            if self.transcribe.call_count == 1:
+                return "First original."
+            second_started.set()
+            self.translation_sessions["openai"].translations[0] = "Fast English arrived."
+            if not release.wait(5):
+                raise RuntimeError("The UI did not publish fast output during blocked ASR.")
+            return "Second original."
+
+        def observe_render(texts, *args, **kwargs):
+            nonlocal interrupted
+            if second_started.is_set() and not interrupted:
+                interrupted = True
+                st.rerun()
+            slow = kwargs.get("slow_lane", {})
+            if (second_started.is_set() and not release.is_set() and texts == ["First original."]
+                    and args[0][0] == "Fast English arrived."
+                    and slow.get("translations") == ["Fast English arrived."] and self.correct.call_count):
+                rendered_while_blocked.set()
+                release.set()
+            return render_transcript(texts, *args, **kwargs)
+
+        self.transcribe.side_effect = transcribe
+        self.start_patch("src.ui.render_transcript", side_effect=observe_render)
+        self.select_wav()
+        self.app.button(key="transcribe_file").click().run(timeout=8)
+
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertTrue(interrupted)
+        self.assertTrue(rendered_while_blocked.is_set())
+        state = self.app.session_state["upload_state"]
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["texts"], ["First original.", "Second original."])
+        self.assertEqual(self.transcribe.call_count, 2)
+        self.assertIn("Fast English arrived.", self.transcript_html())
+
+    def test_speaker_offsets_reach_corrections_and_references_stay_out_of_model_inputs(self):
+        source_reference, english_reference = "來源參考秘密", "PRIVATE ENGLISH REFERENCE"
+        self.start_patch("src.reference_tables.read_reference_tables", return_value={
+            "Transcript": [
+                ["text_zh_TW", "translation_en"],
+                [source_reference, english_reference], ["第二參考行", "Second reference line"],
+                ["第三參考行", "Third reference line"],
+            ],
+        })
+        audio_segments = [
+            {"audio": np.zeros(800, dtype=np.float32), "start_s": 0.0, "end_s": 0.05},
+            {"audio": np.zeros(640, dtype=np.float32), "start_s": 0.06, "end_s": 0.1},
+        ]
+        split = self.start_patch("src.uploads.speech_segments", return_value=audio_segments)
+        self.diarization.snapshot.return_value = {
+            "status": "complete", "pending": 0, "error": None,
+            "segments": [
+                {"start_s": 0.005, "end_s": 0.045, "speaker_id": "Speaker 1"},
+                {"start_s": 0.06, "end_s": 0.1, "speaker_id": "Speaker 2"},
+            ],
+        }
+        self.transcribe.side_effect = ["模型輸出一", "模型輸出二"]
+        self.select_evaluation(b"synthetic workbook", reference_name="reference.xlsx")
+        self.evaluate_file()
+        snapshot = self.wait_for_corrections()
+        self.app.run()
+
+        self.assertEqual(len(self.app.exception), 0)
+        split.assert_called_once()
+        self.assertTrue(split.call_args.kwargs["with_timestamps"])
+        self.diarization.push.assert_called_once()
+        np.testing.assert_array_equal(self.diarization.push.call_args.args[0], np.zeros(1600, dtype=np.float32))
+        self.diarization.finish.assert_called_once_with()
+        rows = re.findall(r'<li class="transcript-row"[^>]*>(.*?)</li>', self.transcript_html(), re.DOTALL)
+        self.assertEqual(len(rows), 2)
+        for index, row in enumerate(rows, 1):
+            self.assertIn(f"Speaker {index}", row)
+        requests = [call.args[0] for call in self.correct.call_args_list]
+        self.assertTrue(requests)
+        sent = {row["source_text"]: row for request in requests for row in request["segments"]}
+        stored = {row["source_text"]: row for row in snapshot["segments"]}
+        for text, label, start in (("模型輸出一", "Speaker 1", 0.0), ("模型輸出二", "Speaker 2", 0.06)):
+            self.assertEqual(sent[text]["speaker_id"], label)
+            self.assertEqual(stored[text]["timing"]["start_s"], start)
+        serialized = json.dumps(requests, ensure_ascii=False)
+        self.assertNotIn(source_reference, serialized)
+        self.assertNotIn(english_reference, serialized)
+        self.assertNotIn('"audio"', serialized)
+        for key in ("translation", "tencent_translation"):
+            self.assertEqual(self.app.session_state[key].sources, ["模型輸出一", "模型輸出二"])
+        reference_pane = re.search(r'<section class="reference-pane".*?</section>', self.transcript_html(), re.DOTALL).group(0)
+        self.assertIn(english_reference, reference_pane)
+        self.assertIn("R03", reference_pane)
+        self.assertNotIn("模型輸出一", reference_pane)
+        self.assertEqual(set(self.evaluation_scores()), {"Breeze · Mixed match"})
+
+    def test_correction_and_speaker_failures_preserve_fast_results_and_allow_correction_retry(self):
+        confirm = self.correct.side_effect
+        self.correct.side_effect = RuntimeError("PRIVATE API ERROR")
+        self.diarization.snapshot.return_value = {
+            "status": "failed", "segments": [], "pending": 0,
+            "error": "Speaker diarization is unavailable.",
+        }
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)])
+        self.select_wav()
+        self.transcribe_file()
+        degraded = self.wait_for_corrections()
+        self.app.run()
+
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertEqual(degraded["status"], "degraded")
+        self.assertIn("Corrections unavailable", self.rendered_text())
+        self.assertIn("Speaker detection failed", self.rendered_text())
+        self.assertIn("Speaker unknown", self.transcript_html())
+        self.assertIn("A short transcript", self.transcript_html())
+        self.assertIn("English segment 1.", self.transcript_html())
+        self.assertIn("Tencent segment 1.", self.transcript_html())
+        self.assertNotIn("PRIVATE API ERROR", json.dumps(degraded))
+        self.correct.side_effect = confirm
+        self.app.button(key="retry_corrections").click().run()
+        recovered = self.wait_for_corrections()
+        self.app.run()
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertEqual(recovered["authoritative"], ["English segment 1."])
+        self.assertIn(">Confirmed</span>", self.transcript_html())
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.correct.call_count, 2)
 
 
 if __name__ == "__main__":

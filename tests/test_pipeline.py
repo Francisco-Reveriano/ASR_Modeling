@@ -4,7 +4,7 @@ from fractions import Fraction
 from queue import Empty, Queue
 from threading import Event
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import av
 import numpy as np
@@ -158,6 +158,22 @@ class LiveTranscriberTests(unittest.TestCase):
         self.assertEqual(self.segments[0].shape, (1600,))
         self.assertTrue(np.isfinite(self.segments[0]).all())
         self.assertGreater(float(self.segments[0].mean()), 0.1)
+
+    def test_diarization_receives_continuous_audio_including_silence_with_asr_offsets(self):
+        diarization = Mock()
+        pipeline = self.make_pipeline(ScriptedVAD({2: {"start": 512}, 4: {"end": 1800}}), diarization=diarization)
+        samples = np.arange(2400, dtype=np.float32) / 2400
+        for start, end in ((0, 300), (300, 1400), (1400, 2400)):
+            pipeline.push(audio_frame(samples[start:end], offset=start))
+        self.finish(pipeline)
+        captured = np.concatenate([call.args[0] for call in diarization.push.call_args_list])
+        np.testing.assert_array_equal(captured, samples)
+        diarization.finish.assert_called()
+        timing = pipeline.snapshot()["timings"][0]
+        self.assertEqual((timing["start_s"], timing["end_s"]), (512 / SAMPLE_RATE, 1800 / SAMPLE_RATE))
+        self.assertGreaterEqual(timing["asr_final_ms"], timing["asr_start_ms"])
+        self.assertIsNone(timing["t_capture_ms"])
+        np.testing.assert_array_equal(pipeline._retained_audio[0], samples[512:1800])
 
     def test_stop_drains_audio_enqueued_immediately_after_worker_timeout(self):
         timed_out, release = Event(), Event()

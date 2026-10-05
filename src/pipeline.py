@@ -32,6 +32,7 @@ import logging
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+from time import monotonic
 
 import av
 import numpy as np
@@ -154,18 +155,22 @@ class LiveTranscriber:
     Create a new instance to restart; a stopped instance cannot be reused.
     """
 
-    def __init__(self, transcribe, vad, *, max_segment_seconds=25, max_pending=8):
+    def __init__(self, transcribe, vad, *, max_segment_seconds=15, max_pending=8,
+                 diarization=None):
         """Prepare recording state without starting a background thread.
 
         Args:
             transcribe: Callable accepting a mono 16 kHz float32 array and
                 returning text. Normally supplied by load_transcriber().
             vad: Fresh streaming detector, normally supplied by load_vad().
-            max_segment_seconds: Positive segment limit. The 25-second
+            max_segment_seconds: Positive segment limit. The 15-second
                 default stays below Breeze's 30-second input window.
             max_pending: Positive capacity for waiting segments. The segment
                 currently being transcribed is outside this queue, so the
                 default permits eight waiting segments plus one in progress.
+            diarization: Optional independent speaker session with nonblocking
+                push() and finish() methods. It receives all resampled audio,
+                including silence, and keeps its speaker history across VAD cuts.
 
         Callables are supplied rather than loaded here so the large ASR model
         can be reused and tests can substitute small, predictable functions.
@@ -187,6 +192,12 @@ class LiveTranscriber:
         self._input_ended = Event()
         self._finished = Event()
         self._texts = []
+        self._timings = []
+        # Keep accepted speech buffers for this session's lifetime. They never
+        # enter UI snapshots or cloud requests; replacing the session releases
+        # them. This is in-memory retention, not durable audio archival.
+        self._retained_audio = []
+        self._diarization = diarization
         # Count both queued and in-progress segments for the UI's status.
         self._pending = 0
         self._error = None
@@ -226,6 +237,10 @@ class LiveTranscriber:
         and leave 188 in _tail. The next input continues exactly where it left
         off; browser frame boundaries do not become speech boundaries.
         """
+        if self._diarization is not None and len(samples):
+            # A separate worker consumes the continuous timeline, including
+            # silence. Never reset speaker identity at each ASR boundary.
+            self._diarization.push(samples)
         samples = np.concatenate((self._tail, samples))
         complete = len(samples) // FRAME_SIZE * FRAME_SIZE
         self._tail = samples[complete:].copy()
@@ -292,7 +307,14 @@ class LiveTranscriber:
             stop = min(end, start + self._max_samples)
             audio = self._buffer[start - self._offset:stop - self._offset].copy()
             try:
-                self._queue.put_nowait(audio)
+                timing = {
+                    "start_s": start / SAMPLE_RATE, "end_s": stop / SAMPLE_RATE,
+                    "server_endpoint_ms": monotonic() * 1000,
+                    # WebRTC here does not expose a synchronized client clock.
+                    "t_capture_ms": None,
+                }
+                self._queue.put_nowait((audio, timing))
+                self._retained_audio.append(audio)
                 self._pending += 1
             except Full:
                 self._fail(
@@ -340,6 +362,8 @@ class LiveTranscriber:
                 self._fail(f"Finishing audio failed: {exc}")
             finally:
                 self._input_ended.set()
+                if self._diarization is not None:
+                    self._diarization.finish()
                 if self._worker.ident is None:
                     self._finished.set()
 
@@ -356,7 +380,7 @@ class LiveTranscriber:
         try:
             while True:
                 try:
-                    audio = self._queue.get(timeout=0.1)
+                    audio, timing = self._queue.get(timeout=0.1)
                 except Empty:
                     # finish() may enqueue its last segment just after get()
                     # times out. Once input has ended, check the queue again
@@ -365,10 +389,13 @@ class LiveTranscriber:
                         return
                     continue
                 try:
+                    timing["asr_start_ms"] = monotonic() * 1000
                     text = self._transcribe(audio)
+                    timing["asr_final_ms"] = monotonic() * 1000
                     with self._lock:
                         if text:
                             self._texts.append(text)
+                            self._timings.append(timing)
                         self._pending -= 1
                 except Exception as exc:
                     logger.exception("Transcription failed")
@@ -379,6 +406,8 @@ class LiveTranscriber:
                         self._pending = 0
                     return
         finally:
+            if self._diarization is not None:
+                self._diarization.finish()
             self._finished.set()
 
     def snapshot(self):
@@ -387,6 +416,11 @@ class LiveTranscriber:
         Returned fields:
             texts: Nonempty completed transcripts, in segment order. The list
                 is copied, so editing the returned list cannot alter this session.
+            timings: Matching audio start/end offsets in seconds and server
+                monotonic processing timestamps in milliseconds. Audio offsets
+                attach speaker labels and captions; monotonic times measure
+                processing delays. t_capture_ms is None because this browser
+                integration does not provide a synchronized client clock.
             pending: Accepted segments still queued or currently being transcribed.
             finished: True once the worker exits, or Stop occurs before any audio.
                 Consult error as well: finished does not imply success.
@@ -400,6 +434,7 @@ class LiveTranscriber:
         with self._lock:
             return {
                 "texts": self._texts.copy(),
+                "timings": [dict(timing) for timing in self._timings],
                 "pending": self._pending,
                 "finished": self._finished.is_set(),
                 "error": self._error,

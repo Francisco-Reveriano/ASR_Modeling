@@ -107,7 +107,7 @@ class SpeechSegmentsTests(unittest.TestCase):
         self.assertIs(arguments[1], vad.model)
         self.assertEqual(settings, {
             "sampling_rate": SAMPLE_RATE, "threshold": 0.5,
-            "min_speech_duration_ms": 250, "max_speech_duration_s": 25,
+            "min_speech_duration_ms": 250, "max_speech_duration_s": 15,
             "min_silence_duration_ms": 500, "speech_pad_ms": 150,
         })
 
@@ -117,6 +117,14 @@ class SpeechSegmentsTests(unittest.TestCase):
         segments, _, _ = self.split(audio, [])
 
         self.assertEqual(segments, [])
+
+    def test_timestamped_segments_keep_original_file_offsets_for_speaker_alignment(self):
+        audio = np.arange(2 * SAMPLE_RATE, dtype=np.float32)
+        detector = Mock(return_value=[{"start": 4000, "end": 12000}, {"start": 16000, "end": 30000}])
+        with patch.dict("sys.modules", {"silero_vad": SimpleNamespace(get_speech_timestamps=detector)}):
+            segments = speech_segments(audio, SimpleNamespace(model=object()), with_timestamps=True)
+        self.assertEqual([(row["start_s"], row["end_s"]) for row in segments], [(0.25, 0.75), (1.0, 1.875)])
+        np.testing.assert_array_equal(segments[1]["audio"], audio[16000:30000])
 
     def test_oversized_span_splits_without_losing_or_repeating_samples(self):
         limit = MAX_SEGMENT_SECONDS * SAMPLE_RATE

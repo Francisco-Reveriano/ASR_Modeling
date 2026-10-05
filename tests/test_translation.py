@@ -1,6 +1,7 @@
 """Test ordered translation and client configuration without making API requests."""
 
 from collections import Counter
+import json
 import os
 from threading import Event
 from types import SimpleNamespace
@@ -14,8 +15,8 @@ from src.translation import (
 
 
 class SessionTestCase(unittest.TestCase):
-    def make_session(self, translate=None):
-        session = TranslationSession(translate)
+    def make_session(self, translate=None, **kwargs):
+        session = TranslationSession(translate, **kwargs)
         self.addCleanup(self.cleanup_session, session)
         return session
 
@@ -33,6 +34,61 @@ class SessionTestCase(unittest.TestCase):
 
 
 class TranslationSessionTests(SessionTestCase):
+    def test_contextual_fast_lane_uses_only_previous_two_segments_and_local_glossary(self):
+        glossary = Mock()
+        glossary.retrieve.return_value = [{"term_src": "腔體", "term_tgt": "chamber"}]
+        glossary.dnt_hits.return_value = ["ETCH-07"]
+        glossary.compare_dnt.return_value = {"ok": True}
+        with patch("src.translation.translate_to_english", side_effect=lambda text, **kwargs: f"English {text}") as translate:
+            session = self.make_session(glossary=glossary, source_lang="zh-TW+en", target_lang="en")
+            texts = [f"ETCH-07 句{i}" for i in range(4)]
+            session.submit(texts)
+            self.join_worker(session)
+
+        self.assertEqual(translate.call_count, 4)
+        for index, call in enumerate(translate.call_args_list):
+            self.assertEqual(call.args, (texts[index],))
+            context = call.kwargs["context"]
+            self.assertEqual(set(context), {"previous", "source_lang", "target_lang", "glossary", "dnt_hits"})
+            self.assertEqual(context["previous"], [
+                {"source_text": texts[i], "target_text": f"English {texts[i]}"}
+                for i in range(max(0, index - 2), index)
+            ])
+            self.assertEqual(context["source_lang"], "zh-TW+en")
+            self.assertEqual(context["target_lang"], "en")
+            self.assertEqual(context["glossary"], glossary.retrieve.return_value)
+            self.assertEqual(context["dnt_hits"], ["ETCH-07"])
+            self.assertEqual(glossary.retrieve.call_args_list[index].args, (texts[index],))
+            self.assertEqual(glossary.retrieve.call_args_list[index].kwargs, {"limit": 40})
+        self.assertEqual(session.snapshot()["errors"], [None] * 4)
+
+    def test_contextual_worker_rejects_changed_or_added_identifiers_without_leaking_details(self):
+        glossary = Mock()
+        glossary.retrieve.return_value = []
+        glossary.dnt_hits.return_value = ["ETCH-07"]
+        glossary.compare_dnt.return_value = {"ok": False, "details": "private glossary details"}
+        with patch("src.translation.translate_to_english", return_value="Check ETCH-070."):
+            session = self.make_session(glossary=glossary)
+            session.submit(["檢查 ETCH-07"])
+            self.join_worker(session)
+
+        glossary.compare_dnt.assert_called_once_with("檢查 ETCH-07", "Check ETCH-070.")
+        self.assertEqual(session.snapshot(), {
+            "translations": [None], "errors": [FAILED_MESSAGE], "pending": 0,
+        })
+
+    def test_custom_provider_keeps_its_simple_text_only_interface(self):
+        glossary = Mock()
+        translate = Mock(return_value="Local English")
+        session = self.make_session(translate, glossary=glossary)
+
+        session.submit(["source"])
+        self.join_worker(session)
+
+        translate.assert_called_once_with("source")
+        glossary.retrieve.assert_not_called()
+        glossary.compare_dnt.assert_not_called()
+
     def test_providers_progress_independently_and_keep_their_own_errors(self):
         started, release = Event(), Event()
 
@@ -236,6 +292,49 @@ class OpenAITranslationTests(SessionTestCase):
         self.assertEqual(settings["model"], "configured-model")
         self.assertNotIn("reasoning", settings)
         self.assertNotIn("tools", settings)
+
+    def test_context_request_bounds_and_allowlists_its_data_without_replacing_source(self):
+        text = "檢查 ETCH-07。"
+        context = {
+            "current_source": "WRONG-SOURCE",
+            "evaluation": "PRIVATE-REFERENCE", "audio": "PRIVATE-AUDIO",
+            "source_lang": "zh-TW+en", "target_lang": "en", "dnt_hits": ["ETCH-07"],
+            "previous": [
+                {"source_text": f"source-{i}", "target_text": f"target-{i}", "reference": "PRIVATE-REFERENCE"}
+                for i in range(4)
+            ],
+            "glossary": [
+                {"entry_id": str(i), "term_src": f"term-{i}", "term_tgt": f"word-{i}",
+                 "reference": "PRIVATE-REFERENCE", "audio": "PRIVATE-AUDIO"}
+                for i in range(45)
+            ],
+        }
+        self.client.responses.create.return_value = SimpleNamespace(status="completed", output_text="Check ETCH-07.")
+
+        self.assertEqual(translate_to_english(text, context=context), "Check ETCH-07.")
+
+        settings = self.client.responses.create.call_args.kwargs
+        payload = json.loads(settings["input"])
+        self.assertEqual(payload["current_source"], text)
+        self.assertEqual(payload["previous"], [
+            {"source_text": "source-2", "target_text": "target-2"},
+            {"source_text": "source-3", "target_text": "target-3"},
+        ])
+        self.assertEqual(len(payload["glossary"]), 40)
+        self.assertEqual(payload["dnt_hits"], ["ETCH-07"])
+        self.assertNotIn("PRIVATE", settings["input"])
+        self.assertNotIn("WRONG-SOURCE", settings["input"])
+        self.assertEqual(settings["max_output_tokens"], 512)
+        self.assertIs(settings["store"], False)
+        self.assertIn("Translate only current_source", settings["instructions"])
+
+    def test_context_adapter_rejects_missing_case_changed_or_punctuation_changed_dnt(self):
+        for output in ("Check the chamber.", "Check etch-07.", "Check ETCH 07."):
+            with self.subTest(output=output):
+                self.client.responses.create.return_value = SimpleNamespace(status="completed", output_text=output)
+
+                with self.assertRaisesRegex(ValueError, "protected identifier"):
+                    translate_to_english("檢查 ETCH-07", context={"dnt_hits": ["ETCH-07"]})
 
     def test_blank_model_setting_uses_the_default(self):
         os.environ["OPENAI_DEFAULT_MODEL"] = "  "

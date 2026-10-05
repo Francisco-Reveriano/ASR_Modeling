@@ -2,6 +2,9 @@
 
 from io import BytesIO
 from math import gcd
+from concurrent.futures import Future
+from threading import Thread
+from time import monotonic
 
 import numpy as np
 import soundfile as sf
@@ -10,7 +13,29 @@ import torch
 
 from src.pipeline import SAMPLE_RATE, SPEECH_PAD_MS
 
-MAX_SEGMENT_SECONDS = 25
+MAX_SEGMENT_SECONDS = 15
+
+
+def transcribe_in_background(transcribe, audio):
+    """Return one reusable decode task while the UI polls completed translations.
+
+    The upload job retains this Future across Streamlit reruns. Only its owner
+    appends the result, so an interrupted UI run neither repeats ASR nor lets an
+    old task write into a replacement session. The ASR callable still acquires
+    the shared local-model lock; this worker never loads or calls translators.
+    """
+    future = Future()
+
+    def run():
+        try:
+            started = monotonic() * 1000
+            text = transcribe(audio)
+            future.set_result((text, started, monotonic() * 1000))
+        except Exception as exc:
+            future.set_exception(exc)
+
+    Thread(target=run, daemon=True, name="upload-transcription").start()
+    return future
 
 
 def decode_wav(data: bytes) -> np.ndarray:
@@ -44,8 +69,8 @@ def decode_wav(data: bytes) -> np.ndarray:
     return np.ascontiguousarray(audio, dtype=np.float32)
 
 
-def speech_segments(audio: np.ndarray, vad) -> list[np.ndarray]:
-    """Return ordered speech views, each at most 25 seconds, from decoded audio.
+def speech_segments(audio: np.ndarray, vad, *, with_timestamps=False) -> list:
+    """Return ordered speech views, each at most 15 seconds, from decoded audio.
 
     Pass the mono 16 kHz array from decode_wav and a fresh load_vad() iterator.
     Silero resets its model state and returns sample boundaries that already
@@ -71,5 +96,9 @@ def speech_segments(audio: np.ndarray, vad) -> list[np.ndarray]:
         end = min(len(audio), speech["end"])
         # Keep Breeze's input bounded even if a VAD span exceeds its limit.
         for offset in range(start, end, max_samples):
-            segments.append(audio[offset:min(offset + max_samples, end)])
+            stop = min(offset + max_samples, end)
+            samples = audio[offset:stop]
+            segments.append({
+                "audio": samples, "start_s": offset / SAMPLE_RATE, "end_s": stop / SAMPLE_RATE,
+            } if with_timestamps else samples)
     return segments

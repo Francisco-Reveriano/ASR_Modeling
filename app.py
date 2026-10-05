@@ -26,7 +26,7 @@ st.markdown(
 )
 st.title("Voice transcription & translation")
 st.markdown(
-    '<p class="page-intro">Speak live, upload a WAV file, or evaluate transcription and translation against a reference.</p>',
+    '<p class="page-intro">Speak live, upload a WAV file, or evaluate transcription against a reference.</p>',
     unsafe_allow_html=True,
 )
 
@@ -81,19 +81,19 @@ def conversation_args(texts, translated):
 
 
 def evaluation_references(evaluation):
-    """Match each model to a reference in the language of its output."""
+    """Return the source reference used to score Breeze transcription."""
     primary = evaluation.get("reference") or {
         "text": evaluation["reference_text"], "name": evaluation["reference_name"],
         "has_cjk": False, "format": "Plain text",
     }
     if evaluation.get("reference_kind", "english") == "source":
-        english = evaluation.get("english_reference")
-        return {"breeze": primary, "openai": english, "tencent": english}
-    return {"openai": primary, "tencent": primary}
+        return {"breeze": primary}
+    # A previously submitted translation reference cannot grade source speech.
+    return {"breeze": None}
 
 
-def evaluation_results(state, translated):
-    """Score complete file outputs only; a failed or pending run has no score.
+def evaluation_results(state):
+    """Score the complete Breeze transcript; translators are never scored.
 
     The reference belongs to the submitted job and is never passed to a model.
     Cache completed alignments in this session so polling does not recalculate
@@ -103,27 +103,19 @@ def evaluation_results(state, translated):
     cached = evaluation.setdefault("scores", {})
     results = {}
     for provider, reference in evaluation_references(evaluation).items():
-        mixed = provider == "breeze" and reference["has_cjk"]
+        mixed = reference is not None and reference["has_cjk"]
         result = {
-            "label": {"breeze": "Breeze", "openai": "OpenAI", "tencent": "Tencent"}[provider],
+            "label": "Breeze",
             "metric": "Mixed match" if mixed else "1-wMER", "metrics": None,
         }
-        output = translated.get(provider)
         if reference is None:
-            result["status"] = "English reference needed"
+            result["status"] = "Source transcript needed"
         elif not state["finished"]:
             result["status"] = "Waiting for transcription"
         elif state["error"]:
             result["status"] = "Transcription failed · no final score"
-        elif output is not None and any(output["errors"]):
-            result["status"] = "Translation failed · retry to score"
-        elif output is not None and (
-            output["pending"] or len(output["translations"]) != len(state["texts"])
-            or any(text is None for text in output["translations"])
-        ):
-            result["status"] = "Waiting for translation"
         else:
-            hypothesis = " ".join(state["texts"] if provider == "breeze" else output["translations"])
+            hypothesis = " ".join(state["texts"])
             if provider not in cached or cached[provider]["hypothesis"] != hypothesis:
                 score = mixed_match_score if mixed else word_match_score
                 cached[provider] = {
@@ -136,8 +128,8 @@ def evaluation_results(state, translated):
 
 
 def evaluation_panel(state, results):
-    """Show whole-file scores only for outputs with a matching reference."""
-    st.markdown('<h3 class="evaluation-heading">Evaluation scores</h3>', unsafe_allow_html=True)
+    """Show Breeze's whole-file transcription score."""
+    st.markdown('<h3 class="evaluation-heading">Transcription score</h3>', unsafe_allow_html=True)
     st.caption("Reference match · Higher is better")
     columns = st.columns(len(results), gap="medium")
     for column, (provider, result) in zip(columns, results.items()):
@@ -156,16 +148,15 @@ def evaluation_panel(state, results):
                 )
     with st.expander("Reference & scoring details"):
         references = evaluation_references(state["evaluation"])
-        for provider in ("breeze", "openai"):
+        for provider in ("breeze",):
             reference = references.get(provider)
             if reference is not None:
-                kind = "Source transcript" if provider == "breeze" else "English translation"
-                st.caption(f"{kind}: {reference['name']} · {reference['format']}")
+                st.caption(f"Source transcript: {reference['name']} · {reference['format']}")
                 with st.container(height=180):
                     st.text(reference["text"])
         st.markdown(
             "**Match score = matches / (matches + substitutions + deletions + insertions).** "
-            "English uses words (1-wMER). A Chinese/English source uses each Chinese character "
+            "An English transcript uses words (1-wMER). A Chinese/English transcript uses each Chinese character "
             "and each English word (Mixed match). Case and punctuation are ignored; Unicode is normalized."
         )
         st.caption(
@@ -178,7 +169,7 @@ def evaluation_panel(state, results):
 def evaluation_report(state, results):
     """Include final scores or explicit pending/failure states in the TXT export."""
     lines = [
-        "Evaluation: reference match scores",
+        "Evaluation: Breeze transcription score",
         f"Audio: {state['name']}",
         "Scoring: whole-file alignment; Unicode normalized; case/punctuation ignored.",
         "Formula: matches / (matches + substitutions + deletions + insertions)",
@@ -197,11 +188,10 @@ def evaluation_report(state, results):
         else:
             lines.append(f"{label}: {result['status']}")
     for provider, reference in evaluation_references(state["evaluation"]).items():
-        if provider == "tencent" or reference is None:
+        if reference is None:
             continue
-        kind = "Source transcript" if provider == "breeze" else "English translation"
         lines.extend([
-            "", f"{kind} reference: {reference['name']} ({reference['format']})",
+            "", f"Source transcript reference: {reference['name']} ({reference['format']})",
             "Spoken reference used for scoring:", reference["text"],
         ])
         if reference.get("original_text", reference["text"]) != reference["text"]:
@@ -277,7 +267,7 @@ def transcript_panel(state=None, context=None):
                 st.session_state[key].retry_failed()
                 st.rerun()
     if is_evaluation:
-        results = evaluation_results(state, translated)
+        results = evaluation_results(state)
         evaluation_panel(state, results)
     st.markdown(
         render_transcript(*conversation_args(texts, translated)),
@@ -392,16 +382,10 @@ def reference_inputs(busy):
         st.session_state.pop("evaluation_error", None)
 
     uploaded = st.file_uploader(
-        "Reference transcript or translation", type=["txt", "srt", "vtt"],
+        "Reference transcript", type=["txt", "srt", "vtt"],
         key="eval_reference_file", disabled=busy, on_change=clear_error, max_upload_size=1,
     )
     with st.expander("Reference settings"):
-        kind_choice = st.selectbox(
-            "Reference type", ["Auto-detect", "Source transcript", "English translation"],
-            key="eval_reference_kind", disabled=busy, on_change=clear_error,
-            help="Auto uses Source transcript when the spoken text contains Chinese characters; "
-                 "otherwise English translation. Override this for English source speech.",
-        )
         format_choice = st.selectbox(
             "Reference format", ["Auto-detect", "Plain text", "Transcript / captions"],
             key="eval_reference_format", disabled=busy, on_change=clear_error,
@@ -417,33 +401,15 @@ def reference_inputs(busy):
             format={"Auto-detect": "auto", "Plain text": "plain", "Transcript / captions": "transcript"}[format_choice],
         )
         reference["name"] = uploaded.name
-        kind = "source" if reference["has_cjk"] else "english"
-        if kind_choice != "Auto-detect":
-            kind = "source" if kind_choice == "Source transcript" else "english"
-        label = "Source transcript" if kind == "source" else "English translation"
-        st.caption(f"{label} · {reference['format']} · {reference['segment_count']} reference segment(s)")
+        st.caption(f"{reference['format']} · {reference['segment_count']} reference segment(s)")
         with st.expander("Preview spoken reference"):
             st.caption(f"Excluded {reference['removed_lines']} metadata / non-target line(s).")
             with st.container(height=180):
                 st.text(reference["text"])
-        english_reference = None
-        if kind == "source":
-            st.caption("Breeze is scored against this transcript. Add an English reference to also score translations.")
-            english_file = st.file_uploader(
-                "English translation reference (optional)", type=["txt", "srt", "vtt"],
-                key="eval_english_reference_file", disabled=busy, on_change=clear_error, max_upload_size=1,
-            )
-            if english_file is not None:
-                english_reference = parse_reference(english_file.getvalue(), english_file.name)
-                english_reference["name"] = english_file.name
-                with st.expander("Preview English reference"):
-                    st.caption(f"{english_reference['format']} · {english_reference['segment_count']} reference segment(s)")
-                    with st.container(height=180):
-                        st.text(english_reference["text"])
+        st.caption("Use the words spoken in the audio, in their original language. Breeze is scored against this transcript.")
         return {
             "reference_text": reference["text"], "reference_name": uploaded.name,
-            "reference_kind": kind, "reference": reference,
-            "english_reference": english_reference,
+            "reference_kind": "source", "reference": reference,
         }, True, None
     except ValueError as exc:
         return None, True, str(exc)
@@ -504,7 +470,7 @@ def upload_panel(session, context, *, evaluate=False):
         st.caption("Stop recording and wait for transcription to finish before uploading a file.")
     elif evaluate:
         st.caption(
-            "Transcribe and translate the audio, then score each output with a matching reference. "
+            "Transcribe and translate the audio, then score the Breeze transcript against your reference. "
             "Starting a new evaluation replaces the current results."
         )
     else:

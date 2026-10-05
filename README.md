@@ -69,16 +69,11 @@ excluded in transcript mode. Dialogue and its order are retained. **Reference
 settings → Plain text** keeps the original content when that is what you need.
 The preview reports detected format, retained segments, and excluded lines.
 
-- **Source transcript:** scores Breeze against the words spoken in the audio.
-  Chinese/English references use **Mixed match**: each Chinese character and each
-  English word is one unit. Add an optional **English translation reference** to
-  also score OpenAI and Tencent; otherwise their translations appear unscored.
-- **English translation:** scores OpenAI and Tencent with **1-wMER**. Breeze's
-  source transcript remains visible.
-
-Auto-detection chooses source when the cleaned reference contains Chinese
-characters, otherwise English translation. Override **Reference type** for an
-English source transcript or an English reference containing Chinese names.
+Provide a **source transcript** containing the words spoken in the audio, in their
+original language. Only Breeze receives a transcription score. OpenAI and Tencent
+translations remain visible and included in downloads, without numerical scores.
+Chinese/English references use **Mixed match**: each Chinese character and each
+English word is one unit. English source transcripts use **1-wMER** with word units.
 References stay local and are never supplied to a model.
 
 Here `wMER` means **word-level match error rate**, computed with
@@ -93,8 +88,8 @@ score = 1 - wMER
 Scores appear as percentages: 100% is a perfect normalized match; higher is better.
 Mixed match uses the same formula with mixed units instead of words. It is a
 bounded match score, distinct from conventional ASR mixed error rate, which uses
-reference length as its denominator. Each model's completed segments are joined
-and aligned against its whole reference once. Reference line breaks do not need
+reference length as its denominator. Breeze's completed segments are joined
+and aligned against the whole reference once. Reference line breaks do not need
 to match speech pauses. There is no speaker/time alignment; overlapping speech
 is evaluated in transcript order and can affect the score.
 
@@ -105,9 +100,9 @@ Traditional and simplified characters are not converted into each other.
 **This measures text matching, not semantic translation quality**; valid
 paraphrases can score lower. Only outputs with a matching reference are scored.
 
-Pending or failed outputs have no final score. Retry that provider to finish its
-evaluation. Successfully processed silence against a nonempty reference scores
-0%. **Download evaluation** includes all outputs, scores, alignment counts,
+Pending or failed transcription has no final score. Translation delays or failures
+do not affect Breeze's score. Successfully processed silence against a nonempty
+reference scores 0%. **Download evaluation** includes all outputs, the Breeze score, alignment counts,
 cleaned reference text, original structured text, and filenames. Selecting new
 files or changing reference settings does not change an existing evaluation;
 **Run evaluation** starts a new one and freezes its inputs and settings.

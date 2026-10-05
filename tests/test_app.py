@@ -535,25 +535,12 @@ class RecordingAppTests(unittest.TestCase):
             return_value=[np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32)],
         )
         score = self.start_patch("src.evaluation.word_match_score", wraps=word_match_score)
-        self.transcribe.side_effect = ["第一句。", "第二句。"]
-
-        def create_translation(translate=None, **kwargs):
-            session = FakeTranslationSession(translate, **kwargs)
-            outputs = ["Hello", "world"] if translate else ["Hello", "wonderful world"]
-
-            def submit(texts):
-                session._submit(texts)
-                session.translations = outputs[:len(session.sources)]
-
-            session.submit.side_effect = submit
-            return session
-
-        self.make_translation.side_effect = create_translation
+        self.transcribe.side_effect = ["Hello", "wonderful world"]
         interrupted = False
 
         def render_with_one_rerun(texts, *args, **kwargs):
             nonlocal interrupted
-            if texts == ["第一句。"] and not interrupted:
+            if texts == ["Hello"] and not interrupted:
                 interrupted = True
                 st.rerun()
             return render_transcript(texts, *args, **kwargs)
@@ -563,17 +550,12 @@ class RecordingAppTests(unittest.TestCase):
         self.evaluate_file()
 
         self.assertTrue(interrupted)
-        self.assertEqual(self.evaluation_scores(), {
-            "OpenAI · 1-wMER": "100.0%", "Tencent · 1-wMER": "66.7%",
-        })
-        self.assertCountEqual([call.args for call in score.call_args_list], [
-            ("Hello wonderful world.", "Hello wonderful world"),
-            ("Hello wonderful world.", "Hello world"),
-        ])
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "100.0%"})
+        score.assert_called_once_with("Hello wonderful world.", "Hello wonderful world")
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        self.assertIn("第一句。", self.transcript_html())
-        self.assertIn("第二句。", self.transcript_html())
+        self.assertIn("Hello", self.transcript_html())
+        self.assertIn("wonderful world", self.transcript_html())
         self.assertEqual(self.app.download_button(key="download_transcript").label,
                          "Download evaluation")
 
@@ -589,17 +571,17 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(state["evaluation"]["reference_text"], "Hello wonderful world.")
         self.assertTrue(state["finished"])
         self.assertNotIn("upload_job", self.app.session_state)
-        self.assertEqual(score.call_count, 2)
+        self.assertEqual(score.call_count, 1)
         self.assertEqual(self.transcribe.call_count, 2)
         segments.assert_called_once()
         self.load_vad.assert_called_once_with()
         self.load_transcriber.assert_called_once_with()
         for session in (translation, tencent):
-            self.assertEqual(session.sources, ["第一句。", "第二句。"])
+            self.assertEqual(session.sources, ["Hello", "wonderful world"])
             session.close.assert_not_called()
         self.assertEqual(self.make_translation.call_count, 2)
 
-    def test_evaluation_withholds_only_pending_or_failed_provider_and_retry_updates_it(self):
+    def test_translation_pending_failure_and_retry_do_not_change_breeze_score(self):
         from src.evaluation import word_match_score
 
         self.start_patch(
@@ -607,36 +589,34 @@ class RecordingAppTests(unittest.TestCase):
             return_value=[np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32)],
         )
         self.transcribe.side_effect = ["First original.", "Second original."]
-        self.select_evaluation(b"English segment 1. English segment 2.")
+        score = self.start_patch("src.evaluation.word_match_score", wraps=word_match_score)
+        self.select_evaluation(b"First original. Second original.")
         self.evaluate_file()
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
         translation.translations = [None, None]
         tencent.translations = ["English segment 1.", "English segment 2."]
         self.app.run()
-        expected_scores = {"OpenAI · 1-wMER": "—", "Tencent · 1-wMER": "100.0%"}
+        expected_scores = {"Breeze · 1-wMER": "100.0%"}
         self.assertEqual(self.evaluation_scores(), expected_scores)
-        self.assertIn("Waiting for translation", self.rendered_text())
+        self.assertIn("Translating", self.rendered_text())
 
-        score = self.start_patch("src.evaluation.word_match_score", wraps=word_match_score)
         translation.errors = [None, "Translation unavailable"]
         self.app.run()
         self.assertEqual(self.evaluation_scores(), expected_scores)
-        self.assertIn("Translation failed · retry to score", self.rendered_text())
+        self.assertIn("Translation unavailable", self.app.warning[0].value)
         self.app.button(key="retry_translation").click().run()
         self.assertEqual(self.evaluation_scores(), expected_scores)
         translation.retry_failed.assert_called_once_with()
         tencent.retry_failed.assert_not_called()
-        score.assert_not_called()
+        self.assertEqual(score.call_count, 1)
 
         translation.translations = ["English segment 1.", "English segment 2. again"]
         self.app.run()
         self.assertEqual(len(self.app.exception), 0)
-        self.assertEqual(self.evaluation_scores(), {
-            "OpenAI · 1-wMER": "85.7%", "Tencent · 1-wMER": "100.0%",
-        })
+        self.assertEqual(self.evaluation_scores(), expected_scores)
         score.assert_called_once_with(
-            "English segment 1. English segment 2.", "English segment 1. English segment 2. again",
+            "First original. Second original.", "First original. Second original.",
         )
         self.assertEqual(self.transcribe.call_count, 2)
         self.assertEqual(translation.sources, ["First original.", "Second original."])
@@ -679,9 +659,7 @@ class RecordingAppTests(unittest.TestCase):
         self.select_evaluation()
         self.evaluate_file()
 
-        self.assertEqual(self.evaluation_scores(), {
-            "OpenAI · 1-wMER": "0.0%", "Tencent · 1-wMER": "0.0%",
-        })
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "0.0%"})
         self.assertIn("No speech", self.rendered_text())
         self.assertFalse(self.app.download_button(key="download_transcript").disabled)
         self.load_transcriber.assert_not_called()
@@ -689,7 +667,7 @@ class RecordingAppTests(unittest.TestCase):
         for key in ("translation", "tencent_translation"):
             self.assertEqual(self.app.session_state[key].sources, [])
 
-    def test_evaluation_withholds_both_scores_when_asr_fails_after_partial_text(self):
+    def test_evaluation_withholds_breeze_score_when_asr_fails_after_partial_text(self):
         score = self.start_patch("src.evaluation.word_match_score")
         self.start_patch(
             "src.uploads.speech_segments",
@@ -699,9 +677,7 @@ class RecordingAppTests(unittest.TestCase):
         self.select_evaluation()
         self.evaluate_file()
 
-        self.assertEqual(self.evaluation_scores(), {
-            "OpenAI · 1-wMER": "—", "Tencent · 1-wMER": "—",
-        })
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "—"})
         self.assertIn("Transcription failed · no final score", self.rendered_text())
         self.assertIn("Partial original.", self.transcript_html())
         self.assertTrue(self.app.session_state["upload_state"]["finished"])
@@ -716,7 +692,7 @@ class RecordingAppTests(unittest.TestCase):
         self.select_evaluation(SOURCE_REFERENCE)
 
         self.assertTrue(any(element.value == "你好 Teams" for element in self.app.text))
-        self.assertIsNotNone(self.app.file_uploader(key="eval_english_reference_file"))
+        self.assertNotIn("eval_english_reference_file", [item.key for item in self.app.file_uploader])
         self.load_transcriber.assert_not_called()
         self.load_vad.assert_not_called()
         self.make_translation.assert_not_called()
@@ -725,13 +701,10 @@ class RecordingAppTests(unittest.TestCase):
         evaluation = self.app.session_state["upload_state"]["evaluation"]
         self.assertEqual(evaluation["reference_kind"], "source")
         self.assertEqual(evaluation["reference_text"], "你好 Teams")
-        self.assertIsNone(evaluation["english_reference"])
-        expected = {
-            "Breeze · Mixed match": "66.7%",
-            "OpenAI · 1-wMER": "—", "Tencent · 1-wMER": "—",
-        }
+        self.assertNotIn("english_reference", evaluation)
+        expected = {"Breeze · Mixed match": "66.7%"}
         self.assertEqual(self.evaluation_scores(), expected)
-        self.assertIn("English reference needed", self.rendered_text())
+        self.assertNotIn("English reference needed", self.rendered_text())
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
         for session in (translation, tencent):
@@ -747,92 +720,110 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(self.evaluation_scores(), expected)
         self.assertIn("你好 Zoom", self.transcript_html())
 
-    def test_source_reference_with_optional_english_captions_scores_all_three_outputs(self):
+    def test_caption_reference_scores_breeze_and_export_keeps_unscored_translations(self):
+        from streamlit.delta_generator import DeltaGenerator
+
+        downloads = []
+        real_download = DeltaGenerator.download_button
+
+        def capture_download(*args, **kwargs):
+            downloads.append(kwargs["data"])
+            return real_download(*args, **kwargs)
+
+        self.start_patch(
+            "streamlit.delta_generator.DeltaGenerator.download_button",
+            autospec=True, side_effect=capture_download,
+        )
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
-        self.transcribe.return_value = "你好 Teams"
-        self.select_evaluation(SOURCE_REFERENCE)
-        english = b"1\n00:00:00,000 --> 00:00:02,000\nWelcome to Teams.\n"
-        self.app.file_uploader(key="eval_english_reference_file").set_value(
-            ("english.srt", english, "text/plain"),
-        ).run()
+        self.transcribe.return_value = "Welcome to Teams."
+        captions = b"1\n00:00:00,000 --> 00:00:02,000\nWelcome to Teams.\n"
+        self.select_evaluation(captions, reference_name="source.srt")
         self.make_translation.assert_not_called()
         self.evaluate_file()
         for key in ("translation", "tencent_translation"):
             session = self.app.session_state[key]
-            self.assertEqual(session.sources, ["你好 Teams"])
-            session.translations = ["Welcome to Teams."]
+            self.assertEqual(session.sources, ["Welcome to Teams."])
         self.app.run()
 
         self.assertEqual(len(self.app.exception), 0)
-        self.assertEqual(self.evaluation_scores(), {
-            "Breeze · Mixed match": "100.0%",
-            "OpenAI · 1-wMER": "100.0%", "Tencent · 1-wMER": "100.0%",
-        })
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "100.0%"})
         evaluation = self.app.session_state["upload_state"]["evaluation"]
-        self.assertEqual(evaluation["reference_text"], "你好 Teams")
-        self.assertEqual(evaluation["english_reference"]["text"], "Welcome to Teams.")
-        self.assertEqual(evaluation["english_reference"]["name"], "english.srt")
+        self.assertEqual(evaluation["reference_text"], "Welcome to Teams.")
+        self.assertEqual(evaluation["reference_name"], "source.srt")
+        self.assertIn("English (OpenAI): English segment 1.", downloads[-1])
+        self.assertIn("English (Tencent local): Tencent segment 1.", downloads[-1])
+        report = downloads[-1].split("Evaluation: Breeze transcription score", 1)[1]
+        self.assertIn("Breeze (1-wMER): 100.0%", report)
+        self.assertNotIn("OpenAI", report)
+        self.assertNotIn("Tencent", report)
         self.transcribe.assert_called_once()
 
-    def test_reference_kind_override_scores_english_source_and_freezes_submitted_choices(self):
+    def test_english_source_scores_without_override_and_freezes_submitted_format(self):
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
         self.transcribe.return_value = "One two."
         self.select_evaluation(b"One two.")
-        self.app.selectbox(key="eval_reference_kind").select("Source transcript").run()
         self.app.selectbox(key="eval_reference_format").select("Plain text").run()
         self.evaluate_file()
         submitted = self.app.session_state["upload_state"]["evaluation"]
         translation = self.app.session_state["translation"]
         tencent = self.app.session_state["tencent_translation"]
-        expected = {
-            "Breeze · 1-wMER": "100.0%",
-            "OpenAI · 1-wMER": "—", "Tencent · 1-wMER": "—",
-        }
+        expected = {"Breeze · 1-wMER": "100.0%"}
         self.assertEqual(self.evaluation_scores(), expected)
         self.assertEqual(submitted["reference_kind"], "source")
 
-        self.app.selectbox(key="eval_reference_kind").select("English translation").run()
         self.app.selectbox(key="eval_reference_format").select("Transcript / captions").run()
         self.app.download_button(key="download_transcript").click().run()
         self.assertEqual(len(self.app.exception), 0)
         self.assertIs(self.app.session_state["upload_state"]["evaluation"], submitted)
         self.assertEqual(submitted["reference_kind"], "source")
         self.assertEqual(submitted["reference_text"], "One two.")
+        self.assertEqual(submitted["reference"]["format"], "Plain text")
         self.assertEqual(self.evaluation_scores(), expected)
         self.transcribe.assert_called_once()
         translation.close.assert_not_called()
         tencent.close.assert_not_called()
 
         self.evaluate_file()
-        self.assertEqual(self.app.session_state["upload_state"]["evaluation"]["reference_kind"],
-                         "english")
-        self.assertEqual(set(self.evaluation_scores()), {"OpenAI · 1-wMER", "Tencent · 1-wMER"})
+        self.assertEqual(self.app.session_state["upload_state"]["evaluation"]["reference"]["format"],
+                         "Annotated transcript")
+        self.assertEqual(self.evaluation_scores(), expected)
         translation.close.assert_called_once_with()
         tencent.close.assert_called_once_with()
 
-    def test_source_evaluation_withholds_all_scores_on_asr_failure(self):
+    def test_source_evaluation_withholds_score_on_asr_failure(self):
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
         self.transcribe.side_effect = RuntimeError("inference unavailable")
         self.select_evaluation(SOURCE_REFERENCE)
-        self.app.file_uploader(key="eval_english_reference_file").set_value(
-            ("english.txt", b"Welcome to Teams.", "text/plain"),
-        ).run()
         self.evaluate_file()
 
-        self.assertEqual(self.evaluation_scores(), {
-            "Breeze · Mixed match": "—",
-            "OpenAI · 1-wMER": "—", "Tencent · 1-wMER": "—",
-        })
+        self.assertEqual(self.evaluation_scores(), {"Breeze · Mixed match": "—"})
         self.assertIn("Transcription failed · no final score", self.rendered_text())
         self.assertNotIn("upload_job", self.app.session_state)
         for key in ("translation", "tencent_translation"):
             self.assertEqual(self.app.session_state[key].sources, [])
+
+    def test_legacy_translation_reference_is_not_used_to_score_breeze(self):
+        from src.evaluation import word_match_score
+
+        self.start_patch(
+            "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
+        )
+        self.select_evaluation()
+        self.evaluate_file()
+        state = self.app.session_state["upload_state"]
+        state["evaluation"]["reference_kind"] = "english"
+        score = self.start_patch("src.evaluation.word_match_score", wraps=word_match_score)
+        self.app.run()
+
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "—"})
+        self.assertIn("Source transcript needed", self.rendered_text())
+        score.assert_not_called()
 
     def test_live_recording_disables_upload_controls(self):
         self.select_wav()
@@ -843,8 +834,6 @@ class RecordingAppTests(unittest.TestCase):
         self.assertTrue(self.app.button(key="transcribe_file").disabled)
         self.assertTrue(self.app.file_uploader(key="eval_wav_file").disabled)
         self.assertTrue(self.app.file_uploader(key="eval_reference_file").disabled)
-        self.assertTrue(self.app.file_uploader(key="eval_english_reference_file").disabled)
-        self.assertTrue(self.app.selectbox(key="eval_reference_kind").disabled)
         self.assertTrue(self.app.selectbox(key="eval_reference_format").disabled)
         self.assertTrue(self.app.button(key="evaluate_file").disabled)
         self.assertNotIn("upload_job", self.app.session_state)

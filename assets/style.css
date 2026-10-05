@@ -421,14 +421,6 @@ h1 {
     min-height: 0;
 }
 
-.st-key-evaluation_openai [data-testid="stMetricValue"] {
-    color: #08645f;
-}
-
-.st-key-evaluation_tencent [data-testid="stMetricValue"] {
-    color: #42578c;
-}
-
 @container (max-width: 720px) {
     .conversation-columns {
         display: none;

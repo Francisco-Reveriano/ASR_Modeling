@@ -12,34 +12,40 @@ local models are absent from this branch's runtime.
 
 ## End-to-end structure
 
-Solid arrows show the current runtime. The dotted arrows and the **Deferred**
-group show speaker diarization, which this branch does not install or run.
+The production path on this branch has four stages: input, segmentation, ASR,
+and translation. Solid arrows show what runs today. Dotted arrows show speaker
+diarization, which is deferred and not installed or run on this branch.
 
 ```mermaid
 flowchart TD
-    mic["Browser microphone"] --> resample["Local mono 16 kHz resampling"]
-    wav["Uploaded WAV"] --> resample
-    resample --> vad["Local Silero VAD<br/>bounded speech segmentation"]
-    vad -->|"one mono 16 kHz WAV segment per request"| asr["Hosted vLLM ASR<br/>POST /v1/audio/transcriptions"]
-    asr -->|"original-language transcript"| worker["Ordered translation worker"]
-    worker --> translator["Hosted vLLM translator<br/>POST /v1/chat/completions"]
-    translator --> validate["English and protected-identifier validation"]
-    validate -->|"at most one repair request"| translator
-    validate -->|"validated complete English"| rows["UI source and English rows"]
-    rows --> exports["TXT / JSON / CSV / SRT / VTT exports"]
-    ref["Optional local source reference"] --> evaluation["Local ASR evaluation"]
-    asr -->|"joined original-language transcript"| evaluation
-
-    subgraph deferred["Deferred: not installed, configured, or run on this branch"]
-        diarization["nvidia/Nemotron-3-Diarization"]
+    subgraph input["1. Input"]
+        mic["Browser microphone"]
+        file["Audio source file (WAV)"]
+        resample["Local mono 16 kHz resampling"]
     end
-    resample -.->|"continuous mono 16 kHz audio"| diarization
+    mic --> resample
+    file --> resample
+
+    subgraph segmentation["2. VAD or diarization"]
+        vad["Local Silero VAD<br/>bounded speech segments"]
+        diarization["nvidia/Nemotron-3-Diarization<br/>deferred: not run on this branch"]
+    end
+    resample -->|"speech frames"| vad
+    resample -.->|"continuous audio"| diarization
+
+    asr["3. ASR<br/>hosted vLLM<br/>POST /v1/audio/transcriptions"]
+    vad -->|"one WAV segment per request"| asr
+
+    translation["4. Translation<br/>ordered worker, hosted vLLM<br/>POST /v1/chat/completions<br/>English and identifier validation"]
+    asr -->|"original-language transcript"| translation
+
+    rows["Source and English transcript rows"]
+    translation -->|"validated English"| rows
     diarization -.->|"anonymous Speaker N labels"| rows
 ```
 
-Only Silero VAD runs in the app process. Speech segments go to the configured
-ASR instance; completed transcripts go to the selected translator. Source
-references stay local and are used only for evaluation.
+Resampling and Silero VAD run in the app process. ASR and translation run on
+the configured vLLM instances, which may be separate servers with separate keys.
 
 ### Speaker diarization model
 

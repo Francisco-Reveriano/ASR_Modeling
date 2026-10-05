@@ -50,11 +50,30 @@ notebook can prepare the model when needed.
 
 ### Evaluate against a reference
 
-Open **Evaluate**, drop a `.wav` file and its reference as `.txt`, `.srt`, or
-`.vtt`, then check **Preview spoken reference** before clicking **Run evaluation**.
-References may be UTF-8 (with or without BOM) or UTF-16 with BOM, up to 1 MiB each.
+Open **Evaluate**, upload a `.wav` and a reference as `.txt`, `.srt`, `.vtt`,
+`.xlsx`, `.csv`, or `.tsv`, then check the previews before clicking **Run evaluation**.
+References are limited to 1 MiB each. Text and delimited files may be UTF-8
+(with or without BOM) or UTF-16 with BOM.
 The same Silero → Breeze → OpenAI/Tencent pipeline always produces a transcript
 and both English translations.
+
+For spreadsheets and delimited files, use the dropdowns in the **left input pane**:
+
+- **Worksheet** selects one sheet; `transcript` is preferred over background speech or speaker metadata.
+- **Transcription reference column** selects the source words used to score Breeze. `text_zh_TW` is preferred when present.
+- **English reference column** selects the fourth comparison column. `translation_en` is suggested when present; otherwise it shows the source reference.
+- **Reference settings → Header row** changes the header position; `0` includes all rows for files without headers. Unrecognized columns require an explicit source choice.
+
+For the sample workbook, the defaults are `transcript`, `H: text_zh_TW`, and
+`J: translation_en`. Only selected columns are read into references; other sheets,
+speaker fields, timestamps, and notes do not enter the score. Previews report
+blank cells skipped. Formula/error cells in a selected column require pasted text
+values. Workbooks are read locally without modifying them. Tables support up to
+10,000 rows and 100 columns per sheet; XLSX contents may expand to at most 10 MiB.
+
+The fourth column has its own `R01…` reference numbering. Reference lines follow
+the file, while model segments follow speech pauses; they are not paired by row
+number. The English reference supports visual comparison and receives no score.
 
 The app detects plain text, timestamped speaker transcripts, and SRT/WebVTT
 captions. For example, this target line becomes `你好Teams有點lag。`:
@@ -103,7 +122,8 @@ paraphrases can score lower. Only outputs with a matching reference are scored.
 Pending or failed transcription has no final score. Translation delays or failures
 do not affect Breeze's score. Successfully processed silence against a nonempty
 reference scores 0%. **Download evaluation** includes all outputs, the Breeze score, alignment counts,
-cleaned reference text, original structured text, and filenames. Selecting new
+cleaned reference text, original structured text, selected sheet/columns, the
+English comparison reference, and filenames. Selecting new
 files or changing reference settings does not change an existing evaluation;
 **Run evaluation** starts a new one and freezes its inputs and settings.
 
@@ -158,6 +178,8 @@ An already running translation may finish, but cannot populate the new conversat
   `assets/style.css` styles the responsive workspace.
 - `src/evaluation.py` parses reference TXT/SRT/VTT files and computes normalized
   whole-file word or mixed-unit match scores without model or network calls.
+- `src/reference_tables.py` reads XLSX/CSV/TSV references and suggests source and
+  English columns; `openpyxl` reads workbooks in read-only mode.
 - `src/translation.py` provides the OpenAI request and reusable translation queue;
   the app creates one queue for each provider.
 - `src/tencent.py` lazily loads Hy-MT2-1.8B and serializes local generation with a
@@ -193,5 +215,6 @@ python -m unittest discover -s tests -v
 Tests exercise audio resampling, WAV validation, recording and upload lifecycles,
 interrupted-upload recovery, provider isolation, and translation ordering/retries
 with lightweight VAD/inference and API substitutes. Evaluation tests cover the
-score formula, normalization, transcript parsing, reference routing, and incomplete results.
+score formula, normalization, transcript/table parsing, column selection, reference
+routing, frozen evaluation inputs, and incomplete results.
 They do not load either large model or call OpenAI.

@@ -13,7 +13,12 @@ class TranscriptParser(HTMLParser):
         self.segments = []
         self.english = []
         self.tencent_english = []
+        self.reference_numbers = []
+        self.references = []
+        self.reference_headings = []
+        self.reference_inside_segment = False
         self.tags = []
+        self._in_segment = False
         self._capture = None
         self._provider = None
         self.feed(markup)
@@ -21,7 +26,19 @@ class TranscriptParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         self.tags.append(tag)
         classes = dict(attrs).get("class", "").split()
-        if "openai-cell" in classes:
+        if "transcript-row" in classes:
+            self._in_segment = True
+        if "reference-number" in classes:
+            self.reference_numbers.append("")
+            self._capture = self.reference_numbers
+        elif "reference-text" in classes:
+            self.references.append("")
+            self._capture = self.references
+            self.reference_inside_segment |= self._in_segment
+        elif "reference-heading" in classes:
+            self.reference_headings.append("")
+            self._capture = self.reference_headings
+        elif "openai-cell" in classes:
             self._provider = self.english
         elif "tencent-cell" in classes:
             self._provider = self.tencent_english
@@ -45,6 +62,8 @@ class TranscriptParser(HTMLParser):
         self._capture = None
         if tag == "div":
             self._provider = None
+        elif tag == "li":
+            self._in_segment = False
 
 
 class TranscriptRenderingTests(unittest.TestCase):
@@ -112,6 +131,49 @@ class TranscriptRenderingTests(unittest.TestCase):
         self.assertEqual(rendered.segments, [])
         self.assertEqual(rendered.english, [])
         self.assertEqual(rendered.tencent_english, [])
+
+    def test_reference_has_its_own_order_and_numbers_for_different_line_counts(self):
+        references = [f"Reference line {index}" for index in range(1, 44)]
+        texts = [f"Speech segment {index}" for index in range(1, 19)]
+        rendered = TranscriptParser(render_transcript(
+            texts, reference_text="\n".join(references), reference_title="English reference",
+        ))
+
+        self.assertEqual(rendered.segments, texts)
+        self.assertEqual(rendered.numbers, [f"{index:02d}" for index in range(1, 19)])
+        self.assertEqual(rendered.references, references)
+        self.assertEqual(rendered.reference_numbers, [f"R{index:02d}" for index in range(1, 44)])
+        self.assertEqual(rendered.reference_headings, ["English reference"])
+        self.assertFalse(rendered.reference_inside_segment)
+
+        fewer_references = TranscriptParser(render_transcript(texts, reference_text="Only one line"))
+        self.assertEqual(fewer_references.segments, texts)
+        self.assertEqual(fewer_references.references, ["Only one line"])
+
+    def test_reference_is_literal_and_visible_before_any_speech_results(self):
+        title = 'Reference <script>bad()</script> "source"'
+        lines = ['<img src=x onerror="bad()"> & hello', "", "Last line."]
+        rendered = TranscriptParser(render_transcript(
+            [], reference_text="\n".join(lines), reference_title=title,
+        ))
+
+        self.assertEqual(rendered.segments, [])
+        self.assertEqual(rendered.references, lines)
+        self.assertEqual(rendered.reference_numbers, ["R01", "R02", "R03"])
+        self.assertEqual(rendered.reference_headings, [title])
+        self.assertNotIn("script", rendered.tags)
+        self.assertNotIn("img", rendered.tags)
+
+    def test_reference_pane_is_absent_by_default(self):
+        for texts in ([], ["A speech segment."]):
+            with self.subTest(texts=texts):
+                markup = render_transcript(texts)
+                rendered = TranscriptParser(markup)
+
+                self.assertEqual(rendered.references, [])
+                self.assertEqual(rendered.reference_headings, [])
+                self.assertNotIn("reference-pane", markup)
+                self.assertNotIn("Reference lines follow the file", markup)
 
     def test_download_preserves_multiline_text_and_translation_states(self):
         exported = export_conversation(

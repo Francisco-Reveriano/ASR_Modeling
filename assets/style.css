@@ -381,6 +381,83 @@ h1 {
     background: #edf0fb;
 }
 
+.conversation-reference {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    column-gap: 1.2rem;
+}
+
+.model-conversation, .reference-pane {
+    display: grid;
+    grid-template-rows: subgrid;
+    grid-row: span 2;
+    min-width: 0;
+}
+
+.reference-pane {
+    border-left: 1px solid var(--line);
+    padding-left: 1.2rem;
+}
+
+.model-conversation > .transcript-lines,
+.model-conversation > .transcript-empty,
+.reference-lines {
+    align-self: start;
+}
+
+.reference-heading {
+    display: flex;
+    align-items: center;
+    padding: 0.8rem 0.4rem;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.76rem;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.reference-lines {
+    list-style: none;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+.reference-lines .reference-row {
+    display: grid;
+    grid-template-columns: 2rem minmax(0, 1fr);
+    gap: 0.7rem;
+    margin: 0;
+    padding: 1.05rem 0.4rem;
+    border-bottom: 1px solid #edf1f4;
+}
+
+.reference-lines .reference-row:last-child {
+    border-bottom: 0;
+}
+
+.reference-number {
+    padding-top: 0.17rem;
+    color: #7b8d9c;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.reference-text {
+    min-width: 0;
+    font-size: 1.05rem;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.stApp .reference-note {
+    margin: 0.8rem 0 0;
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
 .st-key-transcript_footer {
     border-top: 1px solid var(--line);
     padding-top: 0.9rem;
@@ -419,6 +496,19 @@ h1 {
 
 .st-key-transcript_card:has(.evaluation-heading) .transcript-lines {
     min-height: 0;
+}
+
+@container (max-width: 1050px) {
+    .conversation-reference, .model-conversation, .reference-pane {
+        display: block;
+    }
+
+    .reference-pane {
+        margin-top: 1.2rem;
+        border-left: 0;
+        border-top: 1px solid var(--line);
+        padding-left: 0;
+    }
 }
 
 @container (max-width: 720px) {

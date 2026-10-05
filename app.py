@@ -8,6 +8,10 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from src.evaluation import mixed_match_score, parse_reference, word_match_score
 from src.pipeline import LiveTranscriber, load_transcriber, load_vad
+from src.reference_tables import (
+    parsed_table_reference, read_reference_tables, recommend_columns,
+    suggest_header_row, suggest_table, table_columns,
+)
 from src.tencent import TENCENT_ERROR_MESSAGE, translate_with_tencent
 from src.translation import TranslationSession
 from src.ui import export_conversation, render_transcript
@@ -78,6 +82,26 @@ def conversation_args(texts, translated):
         texts, translated["openai"]["translations"], translated["openai"]["errors"],
         translated["tencent"]["translations"], translated["tencent"]["errors"],
     )
+
+
+def reference_view_args(state):
+    """Show the submitted reference independently of the ASR pause boundaries."""
+    evaluation = state.get("evaluation", {}) if state else {}
+    reference = evaluation.get("reference_view") or evaluation.get("reference")
+    if reference is None:
+        return {}
+    return {
+        "reference_text": reference["text"],
+        "reference_title": reference.get("title", "Reference transcript"),
+    }
+
+
+def reference_description(reference):
+    """Identify the exact submitted file and, for tables, its selected column."""
+    parts = [reference["name"]]
+    if "sheet" in reference:
+        parts.extend([reference["sheet"], reference["column"]])
+    return " · ".join(parts)
 
 
 def evaluation_references(evaluation):
@@ -151,9 +175,13 @@ def evaluation_panel(state, results):
         for provider in ("breeze",):
             reference = references.get(provider)
             if reference is not None:
-                st.caption(f"Source transcript: {reference['name']} · {reference['format']}")
+                st.caption(f"Source transcript: {reference_description(reference)} · {reference['format']}")
                 with st.container(height=180):
                     st.text(reference["text"])
+        view = state["evaluation"].get("reference_view")
+        if view is not None and view["title"] == "English reference":
+            st.caption(f"English reference: {reference_description(view)}")
+            st.caption("Compare this reference with the two translations in the fourth column. Translation is not scored.")
         st.markdown(
             "**Match score = matches / (matches + substitutions + deletions + insertions).** "
             "An English transcript uses words (1-wMER). A Chinese/English transcript uses each Chinese character "
@@ -191,11 +219,17 @@ def evaluation_report(state, results):
         if reference is None:
             continue
         lines.extend([
-            "", f"Source transcript reference: {reference['name']} ({reference['format']})",
+            "", f"Source transcript reference: {reference_description(reference)} ({reference['format']})",
             "Spoken reference used for scoring:", reference["text"],
         ])
         if reference.get("original_text", reference["text"]) != reference["text"]:
             lines.extend(["", "Original uploaded reference:", reference["original_text"]])
+    view = state["evaluation"].get("reference_view")
+    if view is not None and view["title"] == "English reference":
+        lines.extend([
+            "", f"English reference: {reference_description(view)}",
+            "For comparison only; not scored or aligned to speech segments.", view["text"],
+        ])
     return "\n".join(lines)
 
 
@@ -270,7 +304,7 @@ def transcript_panel(state=None, context=None):
         results = evaluation_results(state)
         evaluation_panel(state, results)
     st.markdown(
-        render_transcript(*conversation_args(texts, translated)),
+        render_transcript(*conversation_args(texts, translated), **reference_view_args(state)),
         unsafe_allow_html=True,
     )
     download_text = export_conversation(*conversation_args(texts, translated))
@@ -376,40 +410,126 @@ def recording_panel():
     return session, context
 
 
-def reference_inputs(busy):
-    """Preview parsed references and freeze them only when Run is pressed."""
-    def clear_error():
-        st.session_state.pop("evaluation_error", None)
+@st.cache_data(show_spinner=False, max_entries=4)
+def reference_tables(data, filename):
+    """Reuse a bounded in-memory parse while the user adjusts column choices."""
+    return read_reference_tables(data, filename)
 
+
+def clear_reference_settings(*keys):
+    """Reset dependent selectors before their widgets are created on the rerun."""
+    for key in ("evaluation_error", *keys):
+        st.session_state.pop(key, None)
+
+
+def reference_inputs(busy):
+    """Preview the source and English columns; freeze them only on Run.
+
+    These controls live in the left input pane. Source text is the only scoring
+    input. The separately selected English text is a display/export reference;
+    neither selection is ever passed to the speech or translation models.
+    """
+    column_keys = ("eval_text_column", "eval_display_column")
     uploaded = st.file_uploader(
-        "Reference transcript", type=["txt", "srt", "vtt"],
-        key="eval_reference_file", disabled=busy, on_change=clear_error, max_upload_size=1,
+        "Reference transcript", type=["txt", "srt", "vtt", "xlsx", "csv", "tsv"],
+        key="eval_reference_file", disabled=busy, on_change=clear_reference_settings,
+        args=("eval_reference_sheet", "eval_header_row", *column_keys), max_upload_size=1,
     )
-    with st.expander("Reference settings"):
+    settings = st.expander("Reference settings")
+    with settings:
         format_choice = st.selectbox(
             "Reference format", ["Auto-detect", "Plain text", "Transcript / captions"],
-            key="eval_reference_format", disabled=busy, on_change=clear_error,
+            key="eval_reference_format", disabled=busy, on_change=clear_reference_settings,
             help="Transcript mode removes recognized timestamps, speaker labels, and non-speech notes. "
-                 "Plain text keeps the file content as written.",
+                 "Plain text keeps the selected content as written.",
         )
-    st.caption("TXT, SRT or VTT · UTF-8 or UTF-16 with BOM · Up to 1 MiB per reference.")
+    st.caption("TXT, SRT, VTT, XLSX, CSV or TSV · Up to 1 MiB. Text files: UTF-8 or UTF-16 with BOM.")
     if uploaded is None:
         return None, False, None
+    parse_format = {
+        "Auto-detect": "auto", "Plain text": "plain", "Transcript / captions": "transcript",
+    }[format_choice]
     try:
-        reference = parse_reference(
-            uploaded.getvalue(), uploaded.name,
-            format={"Auto-detect": "auto", "Plain text": "plain", "Transcript / captions": "transcript"}[format_choice],
-        )
-        reference["name"] = uploaded.name
+        view = None
+        if Path(uploaded.name).suffix.lower() in {".xlsx", ".csv", ".tsv"}:
+            tables = reference_tables(uploaded.getvalue(), uploaded.name)
+            sheets = list(tables)
+            sheet = st.selectbox(
+                "Worksheet", sheets, index=sheets.index(suggest_table(tables)),
+                key="eval_reference_sheet", disabled=busy, on_change=clear_reference_settings,
+                args=("eval_header_row", *column_keys),
+            )
+            rows = tables[sheet]
+            with settings:
+                header_number = st.number_input(
+                    "Header row (0 = no header)", min_value=0, max_value=len(rows),
+                    value=suggest_header_row(rows) + 1, step=1,
+                    key="eval_header_row", disabled=busy, on_change=clear_reference_settings,
+                    args=column_keys,
+                    help="Rows through the header are excluded. Choose 0 to include every row.",
+                )
+            header_row = header_number - 1 if header_number else None
+            labels = table_columns(rows, header_row)
+            choices = list(range(len(labels)))
+            recommended = recommend_columns(rows, header_row)
+            source_column = st.selectbox(
+                "Transcription reference column", choices, index=recommended["source"],
+                format_func=lambda index: labels[index], key="eval_text_column", disabled=busy,
+                placeholder="Choose the original-language transcript",
+                on_change=clear_reference_settings,
+                help="Breeze is scored against this column. For your sample, choose text_zh_TW.",
+            )
+            display_choices = [None, *choices]
+            display_column = st.selectbox(
+                "English reference column", display_choices,
+                index=display_choices.index(recommended["display"]),
+                format_func=lambda index: "Use transcription reference" if index is None else labels[index],
+                key="eval_display_column", disabled=busy, on_change=clear_reference_settings,
+                help="Show this column beside both translations. For your sample, choose translation_en. It is not scored.",
+            )
+            if source_column is None:
+                raise ValueError("Choose a transcription reference column containing the words spoken in the audio.")
+
+            def parse_column(column):
+                parsed = parsed_table_reference(
+                    rows, header_row=header_row, text_column=column, format=parse_format,
+                )
+                parsed.update(
+                    name=uploaded.name, sheet=sheet, column=labels[column], header_row=header_number,
+                )
+                return parsed
+
+            reference = parse_column(source_column)
+            if display_column is not None and display_column != source_column:
+                view = dict(parse_column(display_column), title="English reference")
+            data_rows = len(rows) - header_number
+            st.caption(
+                f"Source: {len(reference['rows'])} text row(s); "
+                f"{data_rows - len(reference['rows'])} blank cell(s) skipped."
+            )
+            if view is not None:
+                st.caption(
+                    f"English: {len(view['rows'])} text row(s); "
+                    f"{data_rows - len(view['rows'])} blank cell(s) skipped."
+                )
+        else:
+            reference = parse_reference(uploaded.getvalue(), uploaded.name, format=parse_format)
+            reference["name"] = uploaded.name
+        if view is None:
+            view = dict(reference, title="Reference transcript")
         st.caption(f"{reference['format']} · {reference['segment_count']} reference segment(s)")
         with st.expander("Preview spoken reference"):
             st.caption(f"Excluded {reference['removed_lines']} metadata / non-target line(s).")
             with st.container(height=180):
                 st.text(reference["text"])
-        st.caption("Use the words spoken in the audio, in their original language. Breeze is scored against this transcript.")
+        if view["title"] == "English reference":
+            with st.expander("Preview English reference"):
+                with st.container(height=180):
+                    st.text(view["text"])
+        st.caption("Breeze is scored against the spoken reference. The fourth column shows your selected reference for comparison.")
         return {
             "reference_text": reference["text"], "reference_name": uploaded.name,
-            "reference_kind": "source", "reference": reference,
+            "reference_kind": "source", "reference": reference, "reference_view": view,
         }, True, None
     except ValueError as exc:
         return None, True, str(exc)
@@ -517,7 +637,7 @@ def process_upload():
                 state["pending"] -= 1
                 translated = translation_snapshot(state["texts"])
                 output.markdown(
-                    render_transcript(*conversation_args(state["texts"], translated)),
+                    render_transcript(*conversation_args(state["texts"], translated), **reference_view_args(state)),
                     unsafe_allow_html=True,
                 )
                 progress.progress(

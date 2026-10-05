@@ -9,6 +9,9 @@ def render_transcript(
     errors: list[str | None] | None = None,
     tencent_translations: list[str | None] | None = None,
     tencent_errors: list[str | None] | None = None,
+    *,
+    reference_text: str | None = None,
+    reference_title: str = "Reference transcript",
 ) -> str:
     """Pair each numbered source segment with both English translations.
 
@@ -17,6 +20,10 @@ def render_transcript(
     displayed as text. Missing translations remain visibly pending, and failed
     translations leave the source intact. All columns use the same row index,
     even when one translation provider finishes before the other.
+
+    An optional reference has its own numbered lines in a separate pane. File
+    lines and detected speech segments need not correspond, so they are never
+    paired by position or truncated to the shorter list.
     """
     headings = (
         '<div class="conversation-columns" aria-hidden="true"><span>#</span>'
@@ -24,7 +31,7 @@ def render_transcript(
         '<span>English <small>Tencent · Local</small></span></div>'
     )
     if not texts:
-        return headings + (
+        conversation = headings + (
             '<div class="transcript-empty">'
             '<div class="empty-icon" aria-hidden="true">'
             '<svg viewBox="0 0 32 32" fill="none" stroke="currentColor" '
@@ -34,6 +41,7 @@ def render_transcript(
             '<p>Record your voice or upload a WAV file.<br>'
             'Compare the original with English from OpenAI and local Tencent.</p></div>'
         )
+        return _with_reference(conversation, reference_text, reference_title)
 
     providers = (
         ("openai", "OpenAI · English", translations or [], errors or []),
@@ -65,9 +73,33 @@ def render_transcript(
             f'<span class="segment-text">{escape(text)}</span></div>'
             f'{"".join(cells)}</li>'
         )
-    return (
+    conversation = (
         headings + '<ol class="transcript-lines" role="list" '
         f'aria-label="Transcript segments with English translations">{"".join(rows)}</ol>'
+    )
+    return _with_reference(conversation, reference_text, reference_title)
+
+
+def _with_reference(conversation: str, text: str | None, title: str) -> str:
+    """Place the complete reference beside the model output without row pairing."""
+    if text is None:
+        return conversation
+    rows = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        rows.append(
+            '<li class="reference-row">'
+            f'<span class="reference-number" aria-hidden="true">R{index:02d}</span>'
+            f'<span class="reference-text">{escape(line)}</span></li>'
+        )
+    return (
+        '<div class="conversation-reference">'
+        f'<div class="model-conversation">{conversation}</div>'
+        f'<section class="reference-pane" aria-label="{escape(title)}">'
+        f'<div class="reference-heading">{escape(title)}</div>'
+        '<ol class="reference-lines" role="list" aria-label="Reference file lines">'
+        f'{"".join(rows)}</ol></section></div>'
+        '<p class="reference-note">Reference lines follow the file; '
+        'speech segments follow pauses.</p>'
     )
 
 

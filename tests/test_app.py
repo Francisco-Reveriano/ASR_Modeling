@@ -148,6 +148,22 @@ class RecordingAppTests(unittest.TestCase):
     def evaluation_scores(self):
         return {metric.label: metric.value for metric in self.app.metric}
 
+    def capture_downloads(self):
+        from streamlit.delta_generator import DeltaGenerator
+
+        downloads = []
+        real_download = DeltaGenerator.download_button
+
+        def capture_download(*args, **kwargs):
+            downloads.append(kwargs["data"])
+            return real_download(*args, **kwargs)
+
+        self.start_patch(
+            "streamlit.delta_generator.DeltaGenerator.download_button",
+            autospec=True, side_effect=capture_download,
+        )
+        return downloads
+
     def test_initial_page_waits_for_start_without_loading_models(self):
         self.assertEqual(self.app.title[0].value, "Voice transcription & translation")
         self.assertFalse(self.app.button(key="start_recording").disabled)
@@ -721,19 +737,7 @@ class RecordingAppTests(unittest.TestCase):
         self.assertIn("你好 Zoom", self.transcript_html())
 
     def test_caption_reference_scores_breeze_and_export_keeps_unscored_translations(self):
-        from streamlit.delta_generator import DeltaGenerator
-
-        downloads = []
-        real_download = DeltaGenerator.download_button
-
-        def capture_download(*args, **kwargs):
-            downloads.append(kwargs["data"])
-            return real_download(*args, **kwargs)
-
-        self.start_patch(
-            "streamlit.delta_generator.DeltaGenerator.download_button",
-            autospec=True, side_effect=capture_download,
-        )
+        downloads = self.capture_downloads()
         self.start_patch(
             "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
         )
@@ -824,6 +828,156 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "—"})
         self.assertIn("Source transcript needed", self.rendered_text())
         score.assert_not_called()
+
+    def test_table_english_reference_is_displayed_independently_and_submitted_mapping_is_frozen(self):
+        from src.evaluation import mixed_match_score
+
+        downloads = self.capture_downloads()
+        disabled_during_job = {}
+        mapping_keys = {"eval_reference_sheet", "eval_header_row", "eval_text_column", "eval_display_column"}
+        for widget_name in ("selectbox", "number_input"):
+            real_widget = getattr(st, widget_name)
+
+            def capture_control(*args, _real_widget=real_widget, **kwargs):
+                key = kwargs.get("key")
+                if key in mapping_keys and st.session_state.get("upload_job") is not None:
+                    disabled_during_job[key] = kwargs.get("disabled", False)
+                return _real_widget(*args, **kwargs)
+
+            self.start_patch(f"streamlit.{widget_name}", side_effect=capture_control)
+        table = self.start_patch("src.reference_tables.read_reference_tables", return_value={
+            "Transcript": [["text_zh_TW", "translation_en"], ["你好 Teams", "Hello Teams."]],
+        })
+        self.start_patch(
+            "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
+        )
+        score = self.start_patch("src.evaluation.mixed_match_score", wraps=mixed_match_score)
+        self.transcribe.return_value = "你好 Zoom"
+        self.select_evaluation(b"synthetic workbook", reference_name="original.xlsx")
+
+        self.assertEqual(self.app.selectbox(key="eval_text_column").value, 0)
+        self.assertEqual(self.app.selectbox(key="eval_display_column").value, 1)
+        previews = [element.value for element in self.app.text]
+        self.assertIn("你好 Teams", previews)
+        self.assertIn("Hello Teams.", previews)
+        self.load_transcriber.assert_not_called()
+        self.load_vad.assert_not_called()
+        self.make_translation.assert_not_called()
+        self.evaluate_file()
+
+        self.assertEqual(disabled_during_job, dict.fromkeys(mapping_keys, True))
+        evaluation = self.app.session_state["upload_state"]["evaluation"]
+        self.assertEqual(evaluation["reference"]["text"], "你好 Teams")
+        self.assertEqual(evaluation["reference_view"]["text"], "Hello Teams.")
+        self.assertEqual(evaluation["reference_view"]["title"], "English reference")
+        self.assertEqual(evaluation["reference_view"]["name"], "original.xlsx")
+        self.assertIn("translation_en", evaluation["reference_view"]["column"])
+        self.assertEqual(self.evaluation_scores(), {"Breeze · Mixed match": "66.7%"})
+        score.assert_called_once_with("你好 Teams", "你好 Zoom")
+        reference_pane = re.search(
+            r'<section class="reference-pane".*?</section>', self.transcript_html(), re.DOTALL,
+        ).group(0)
+        self.assertIn("Hello Teams.", reference_pane)
+        self.assertNotIn("你好 Zoom", reference_pane)
+        for key in ("translation", "tencent_translation"):
+            self.assertEqual(self.app.session_state[key].sources, ["你好 Zoom"])
+        self.assertIsInstance(self.transcribe.call_args.args[0], np.ndarray)
+
+        self.app.selectbox(key="eval_display_column").select(None).run()
+        table.return_value = {
+            "Replacement": [["text_zh_TW", "translation_en"], ["其他文字", "Other reference."]],
+        }
+        self.select_evaluation(b"replacement workbook", reference_name="replacement.xlsx")
+        self.app.download_button(key="download_transcript").click().run()
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertIs(self.app.session_state["upload_state"]["evaluation"], evaluation)
+        self.assertEqual(evaluation["reference_view"]["text"], "Hello Teams.")
+        self.assertIn("Hello Teams.", self.transcript_html())
+        self.assertIn("Hello Teams.", downloads[-1])
+        self.assertIn("你好 Teams", downloads[-1])
+        self.assertNotIn("Other reference.", downloads[-1])
+        self.assertEqual(score.call_count, 1)
+        self.transcribe.assert_called_once()
+        self.load_vad.assert_called_once_with()
+        self.assertEqual(self.make_translation.call_count, 2)
+
+    def test_table_mapping_resets_when_header_sheet_or_file_changes(self):
+        table = self.start_patch("src.reference_tables.read_reference_tables", return_value={
+            "First": [
+                ["text_zh_TW", "translation_en", "notes"],
+                ["你好", "Hello", "memo"], ["謝謝", "Thanks", "more"],
+            ],
+            "Second": [["notes", "text_zh_TW", "translation_en"], ["memo", "再見", "Goodbye"]],
+        })
+        self.select_evaluation(b"synthetic workbook", reference_name="mapping.xlsx")
+        self.app.selectbox(key="eval_text_column").select(2).run()
+        self.app.selectbox(key="eval_display_column").select(0).run()
+        self.app.number_input(key="eval_header_row").set_value(2).run()
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertIsNone(self.app.selectbox(key="eval_text_column").value)
+        self.assertIsNone(self.app.selectbox(key="eval_display_column").value)
+
+        self.app.selectbox(key="eval_reference_sheet").select("Second").run()
+        self.assertEqual(self.app.number_input(key="eval_header_row").value, 1)
+        self.assertEqual(self.app.selectbox(key="eval_text_column").value, 1)
+        self.assertEqual(self.app.selectbox(key="eval_display_column").value, 2)
+        self.app.number_input(key="eval_header_row").set_value(0).run()
+        table.return_value = {
+            "Replacement": [["text_zh_TW", "translation_en"], ["替代", "Replacement"]],
+        }
+        self.select_evaluation(b"different workbook", reference_name="replacement.xlsx")
+        self.assertEqual(self.app.selectbox(key="eval_reference_sheet").value, "Replacement")
+        self.assertEqual(self.app.number_input(key="eval_header_row").value, 1)
+        self.assertEqual(self.app.selectbox(key="eval_text_column").value, 0)
+        self.assertEqual(self.app.selectbox(key="eval_display_column").value, 1)
+        self.load_transcriber.assert_not_called()
+        self.load_vad.assert_not_called()
+        self.make_translation.assert_not_called()
+
+    def test_ambiguous_or_invalid_selected_table_cells_preserve_previous_evaluation(self):
+        self.start_patch(
+            "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
+        )
+        self.select_evaluation(b"A short transcript")
+        self.evaluate_file()
+        previous = self.app.session_state["upload_state"]
+        table = self.start_patch("src.reference_tables.read_reference_tables", return_value={
+            "Transcript": [["First", "Second"], ["你好", "Hello"]],
+        })
+        self.select_evaluation(b"ambiguous workbook", reference_name="ambiguous.xlsx")
+        self.assertIsNone(self.app.selectbox(key="eval_text_column").value)
+        self.evaluate_file()
+        self.assertGreater(len(self.app.error), 0)
+        self.assertIs(self.app.session_state["upload_state"], previous)
+
+        for name, row in (("source-formula.xlsx", [None, "Hello"]),
+                          ("display-error.xlsx", ["你好", None])):
+            with self.subTest(name=name):
+                table.return_value = {"Transcript": [["text_zh_TW", "translation_en"], row]}
+                self.select_evaluation(name.encode(), reference_name=name)
+                self.evaluate_file()
+                self.assertGreater(len(self.app.error), 0)
+                self.assertIs(self.app.session_state["upload_state"], previous)
+                self.assertNotIn("upload_job", self.app.session_state)
+        self.transcribe.assert_called_once()
+        self.load_vad.assert_called_once_with()
+        self.assertEqual(self.make_translation.call_count, 2)
+
+    def test_csv_and_tsv_references_preview_selected_columns_without_loading_models(self):
+        for suffix, delimiter in (("csv", ","), ("tsv", "\t")):
+            with self.subTest(suffix=suffix):
+                content = f"text_zh_TW{delimiter}translation_en\n你好 Teams{delimiter}Hello Teams.\n"
+                self.select_evaluation(content.encode(), reference_name=f"reference.{suffix}")
+                self.assertEqual(self.app.selectbox(key="eval_text_column").value, 0)
+                self.assertEqual(self.app.selectbox(key="eval_display_column").value, 1)
+                previews = [element.value for element in self.app.text]
+                self.assertIn("你好 Teams", previews)
+                self.assertIn("Hello Teams.", previews)
+                self.assertFalse(self.app.button(key="evaluate_file").disabled)
+        self.assertNotIn("upload_state", self.app.session_state)
+        self.load_transcriber.assert_not_called()
+        self.load_vad.assert_not_called()
+        self.make_translation.assert_not_called()
 
     def test_live_recording_disables_upload_controls(self):
         self.select_wav()

@@ -1,5 +1,5 @@
 [server]
-# Avoid scanning Transformers' lazy imports while serving live audio.
+# Keep live audio sessions stable; restart after Python/configuration changes.
 fileWatcherType = "none"
 
 [runner]

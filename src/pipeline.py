@@ -2,7 +2,7 @@
 
 VAD (voice activity detection) decides where speech starts and ends. ASR
 (automatic speech recognition) turns that speech into text. Silero handles
-VAD here; the local Breeze model handles ASR.
+VAD here; a configured vLLM endpoint handles ASR.
 
 The audio takes two paths, connected by a queue:
 
@@ -14,22 +14,20 @@ The audio takes two paths, connected by a queue:
 
     Background worker (_run)
         -> take one segment from the queue
-        -> call Breeze
+        -> call the hosted ASR endpoint
         -> store text for the UI to read through snapshot()
 
 Keeping ASR in its own thread lets microphone capture continue during model
 inference. Speech normally ends at a pause; continuous speech is also split
 into bounded segments so it fits the model's input window.
 
-Typical use: load and reuse one transcriber, then create a LiveTranscriber
-with a fresh VAD for each recording. Connect push() and finish() to WebRTC's
+Typical use: create an endpoint client and a fresh VAD for each recording. Connect push() and finish() to WebRTC's
 audio-frame and audio-ended callbacks, and poll snapshot() from the UI.
 This module makes no Streamlit calls and saves no recordings or transcripts
-to disk; model weights are read from the local Models directory.
+to disk. Only the small Silero model runs locally.
 """
 
 import logging
-from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -38,63 +36,13 @@ import av
 import numpy as np
 import torch
 
-from src.model_lock import LOCAL_MODEL_LOCK
-
 SAMPLE_RATE = 16_000  # Both models receive 16,000 audio samples per second.
 FRAME_SIZE = 512  # One Silero inference window: 32 ms at this sample rate.
 SPEECH_PAD_MS = 150  # Keep some audio around detected speech boundaries.
 # Silero can report a start before the current frame. Retain the padding plus
 # one frame of recent silence so the beginning of that speech is still available.
 PRE_ROLL = SAMPLE_RATE * SPEECH_PAD_MS // 1000 + FRAME_SIZE
-# Resolve from this file, so launching from a different directory still works.
-MODEL_DIR = Path(__file__).resolve().parents[1] / "Models" / "breeze-asr-26"
 logger = logging.getLogger(__name__)
-
-
-def load_transcriber():
-    """Load local Breeze weights and return an audio-to-text callable.
-
-    The callable takes a one-dimensional float32 NumPy array containing mono
-    16 kHz audio, normally scaled between -1 and 1. It returns a stripped string
-    without model control tokens. Audio must already be resampled and segmented;
-    LiveTranscriber handles that preparation.
-
-    Loading is expensive: cache/reuse the returned callable in the caller.
-    This function itself does not cache, and each call loads another model.
-    Apple MPS (Metal GPU acceleration) is used when available, otherwise CPU.
-    Both paths use float32. Missing or incompatible local model files raise an
-    exception to the caller; local_files_only prevents a download fallback.
-
-    Loading and inference share an execution lock with the local Tencent
-    translator. Concurrent model work can crash this Mac's Metal runtime. The
-    lock is separate from each recording's audio-buffer lock, so waiting for a
-    model does not block microphone capture or OpenAI requests.
-    """
-    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    with LOCAL_MODEL_LOCK:
-        processor = AutoProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            MODEL_DIR, local_files_only=True, dtype=torch.float32
-        ).to(device).eval()
-
-    def transcribe(audio):
-        """Convert one prepared speech segment into text using the loaded model."""
-        # eval() above selects inference behavior; inference_mode() here also
-        # disables gradient tracking. The processor prepares Whisper features
-        # and a mask indicating which parts are audio rather than padding.
-        with LOCAL_MODEL_LOCK, torch.inference_mode():
-            inputs = processor(
-                audio, sampling_rate=SAMPLE_RATE,
-                return_tensors="pt", return_attention_mask=True,
-            ).to(device)
-            tokens = model.generate(
-                **inputs, task="transcribe", return_timestamps=False,
-            )
-            return processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
-
-    return transcribe
 
 
 def load_vad():
@@ -115,7 +63,7 @@ def load_vad():
     try:
         from silero_vad import VADIterator, load_silero_vad
     finally:
-        # Silero's import sets this globally to one, also affecting Breeze.
+        # Avoid changing thread settings for other work in this process.
         torch.set_num_threads(threads)
     return VADIterator(
         load_silero_vad(), sampling_rate=SAMPLE_RATE,
@@ -156,28 +104,32 @@ class LiveTranscriber:
     """
 
     def __init__(self, transcribe, vad, *, max_segment_seconds=15, max_pending=8,
-                 diarization=None):
+                 on_result=None):
         """Prepare recording state without starting a background thread.
 
         Args:
             transcribe: Callable accepting a mono 16 kHz float32 array and
-                returning text. Normally supplied by load_transcriber().
+                returning text. This session owns and closes its endpoint client.
             vad: Fresh streaming detector, normally supplied by load_vad().
             max_segment_seconds: Positive segment limit. The 15-second
-                default stays below Breeze's 30-second input window.
+                default bounds each request and retained audio buffer.
             max_pending: Positive capacity for waiting segments. The segment
                 currently being transcribed is outside this queue, so the
                 default permits eight waiting segments plus one in progress.
-            diarization: Optional independent speaker session with nonblocking
-                push() and finish() methods. It receives all resampled audio,
-                including silence, and keeps its speaker history across VAD cuts.
+            on_result: Optional callback(texts, snapshot) after a completed
+                transcript. Runs on the worker outside the state lock so it can
+                queue translation immediately without browser polling.
 
-        Callables are supplied rather than loaded here so the large ASR model
-        can be reused and tests can substitute small, predictable functions.
+        Callables are supplied so endpoint configuration is frozen per session
+        and tests can substitute small, predictable functions.
         """
+        if max_segment_seconds <= 0 or max_pending <= 0:
+            raise ValueError("Segment duration and queue capacity must be positive.")
         self._transcribe = transcribe
         self._vad = vad
         self._max_samples = int(max_segment_seconds * SAMPLE_RATE)
+        if self._max_samples < 1:
+            raise ValueError("Segment duration must contain at least one sample.")
         # Keep one resampler for the whole recording: resampling has history
         # and may retain a few samples that finish() must later flush.
         self._resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
@@ -193,11 +145,13 @@ class LiveTranscriber:
         self._finished = Event()
         self._texts = []
         self._timings = []
-        self._diarization = diarization
+        self._on_result = on_result
+        self._closed = False
+        self._client_closed = False
         # Count both queued and in-progress segments for the UI's status.
         self._pending = 0
         self._error = None
-        self._worker = Thread(target=self._run, daemon=True, name="breeze-transcription")
+        self._worker = Thread(target=self._run, daemon=True, name="vllm-transcription")
 
     def push(self, frame):
         """Accept a PyAV AudioFrame and return the original frame to WebRTC.
@@ -207,23 +161,28 @@ class LiveTranscriber:
         at 16 kHz; _feed() then assembles fixed-size VAD frames. A resampler
         call can produce zero, one, or several output frames.
 
-        This callback performs resampling and VAD only, never Breeze inference.
+        This callback performs resampling and VAD only, never hosted inference.
         Calls after Stop or an error are ignored. Audio-processing exceptions
         are logged and exposed through snapshot() rather than escaping into
         WebRTC's callback thread.
         """
         with self._lock:
             if not self._input_ended.is_set():
-                if self._worker.ident is None:
-                    # No idle worker is left behind if microphone permission
-                    # is denied and no audio ever arrives.
-                    self._worker.start()
                 try:
+                    if self._worker.ident is None:
+                        # No idle worker remains when microphone permission
+                        # is denied and no audio ever arrives.
+                        self._worker.start()
                     for audio in self._resampler.resample(frame):
                         self._feed(audio.to_ndarray().reshape(-1))
-                except Exception as exc:
-                    logger.exception("Audio processing failed")
-                    self._fail(f"Audio processing failed: {exc}")
+                except Exception:
+                    logger.error("Audio processing failed")
+                    self._fail("Audio processing failed. Start a new recording to retry.")
+                    if self._worker.ident is None:
+                        self._release_capture_audio()
+                        self._finished.set()
+        if self._finished.is_set():
+            self._close_client()
         return frame
 
     def _feed(self, samples):
@@ -233,10 +192,6 @@ class LiveTranscriber:
         and leave 188 in _tail. The next input continues exactly where it left
         off; browser frame boundaries do not become speech boundaries.
         """
-        if self._diarization is not None and len(samples):
-            # A separate worker consumes the continuous timeline, including
-            # silence. Never reset speaker identity at each ASR boundary.
-            self._diarization.push(samples)
         samples = np.concatenate((self._tail, samples))
         complete = len(samples) // FRAME_SIZE * FRAME_SIZE
         self._tail = samples[complete:].copy()
@@ -330,8 +285,7 @@ class LiveTranscriber:
     def _release_capture_audio(self):
         """Release residual audio after capture and queued ASR have ended.
 
-        The caller holds _lock. Text and timings outlive these buffers; speaker
-        detection owns its own audio copies and may still be finishing.
+        The caller holds _lock. Text and timings outlive these buffers.
         """
         self._buffer = np.empty(0, dtype=np.float32)
         self._tail = np.empty(0, dtype=np.float32)
@@ -368,11 +322,46 @@ class LiveTranscriber:
                 self._fail(f"Finishing audio failed: {exc}")
             finally:
                 self._input_ended.set()
-                if self._diarization is not None:
-                    self._diarization.finish()
                 if self._worker.ident is None:
                     self._release_capture_audio()
                     self._finished.set()
+        if self._finished.is_set():
+            self._close_client()
+
+    def _close_client(self):
+        """Close the owned HTTP client once, outside the audio state lock."""
+        with self._lock:
+            if self._client_closed:
+                return
+            self._client_closed = True
+        close = getattr(self._transcribe, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.error("ASR client cleanup failed")
+
+    def close(self):
+        """Cancel a replaced conversation without waiting for remote inference."""
+        with self._lock:
+            self._closed = True
+            self._on_result = None
+            self._input_ended.set()
+            self._discard_queued()
+            self._pending = 0
+            self._release_capture_audio()
+            if self._worker.ident is None:
+                self._finished.set()
+        self._close_client()
+
+    def _discard_queued(self):
+        # The ASR worker can dequeue without _lock. empty() followed by get()
+        # is not atomic, so drain until the queue itself reports Empty.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                return
 
     def _run(self):
         """Transcribe queued segments in order until input ends and work drains.
@@ -396,20 +385,33 @@ class LiveTranscriber:
                         return
                     continue
                 try:
+                    with self._lock:
+                        if self._closed:
+                            return
                     timing["asr_start_ms"] = monotonic() * 1000
                     text = self._transcribe(audio)
                     timing["asr_final_ms"] = monotonic() * 1000
                     with self._lock:
+                        if self._closed:
+                            return
                         if text:
                             self._texts.append(text)
                             self._timings.append(timing)
                         self._pending -= 1
-                except Exception as exc:
-                    logger.exception("Transcription failed")
+                        observer = self._on_result if text else None
+                        result = self._snapshot_locked()
+                    if observer is not None:
+                        try:
+                            observer(result["texts"], result)
+                        except Exception:
+                            logger.error("Transcript observer failed")
+                except Exception:
+                    logger.error("Hosted transcription failed")
                     with self._lock:
-                        self._fail(f"Transcription failed: {exc}. Start a new recording to retry.")
-                        while not self._queue.empty():
-                            self._queue.get_nowait()
+                        if self._closed:
+                            return
+                        self._fail("Transcription failed. Check the ASR endpoint and start a new recording to retry.")
+                        self._discard_queued()
                         self._pending = 0
                     return
                 finally:
@@ -419,8 +421,7 @@ class LiveTranscriber:
         finally:
             with self._lock:
                 self._release_capture_audio()
-            if self._diarization is not None:
-                self._diarization.finish()
+            self._close_client()
             self._finished.set()
 
     def snapshot(self):
@@ -431,7 +432,7 @@ class LiveTranscriber:
                 is copied, so editing the returned list cannot alter this session.
             timings: Matching audio start/end offsets in seconds and server
                 monotonic processing timestamps in milliseconds. Audio offsets
-                attach speaker labels and captions; monotonic times measure
+                attach captions; monotonic times measure
                 processing delays. t_capture_ms is None because this browser
                 integration does not provide a synchronized client clock.
             pending: Accepted segments still queued or currently being transcribed.
@@ -445,11 +446,14 @@ class LiveTranscriber:
         positive and finished remains False: the worker is draining its queue.
         """
         with self._lock:
-            return {
-                "texts": self._texts.copy(),
-                "timings": [dict(timing) for timing in self._timings],
-                "pending": self._pending,
-                "finished": self._finished.is_set(),
-                "error": self._error,
-                "accepting": not self._input_ended.is_set(),
-            }
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self):
+        return {
+            "texts": self._texts.copy(),
+            "timings": [dict(timing) for timing in self._timings],
+            "pending": self._pending,
+            "finished": self._finished.is_set(),
+            "error": self._error,
+            "accepting": not self._input_ended.is_set(),
+        }

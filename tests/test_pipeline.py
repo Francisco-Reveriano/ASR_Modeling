@@ -98,6 +98,22 @@ class LiveTranscriberTests(unittest.TestCase):
         self.assertEqual(pipeline.snapshot()["pending"], 0)
         self.assertIsNone(pipeline.snapshot()["error"])
 
+    def test_empty_asr_result_skips_false_positive_and_continues(self):
+        callback = Mock()
+        pipeline = self.make_pipeline(
+            ScriptedVAD({1: {"start": 0}}),
+            transcribe=Mock(side_effect=["", "recognized speech"]),
+            max_segment_seconds=512 / SAMPLE_RATE, on_result=callback,
+        )
+        pipeline.push(audio_frame(np.ones(1024)))
+        self.finish(pipeline)
+        state = pipeline.snapshot()
+        self.assertEqual(state["texts"], ["recognized speech"])
+        self.assertEqual(state["timings"][0]["start_s"], 512 / SAMPLE_RATE)
+        self.assertIsNone(state["error"])
+        callback.assert_called_once()
+        self.assertEqual(callback.call_args.args[0], ["recognized speech"])
+
     def test_vad_boundaries_already_include_padding(self):
         vad = ScriptedVAD({4: {"start": 256}, 7: {"end": 3000}})
         pipeline = self.make_pipeline(vad)
@@ -163,16 +179,12 @@ class LiveTranscriberTests(unittest.TestCase):
         self.assertTrue(np.isfinite(self.segments[0]).all())
         self.assertGreater(float(self.segments[0].mean()), 0.1)
 
-    def test_diarization_receives_continuous_audio_including_silence_with_asr_offsets(self):
-        diarization = Mock()
-        pipeline = self.make_pipeline(ScriptedVAD({2: {"start": 512}, 4: {"end": 1800}}), diarization=diarization)
+    def test_asr_offsets_include_silence_before_speech(self):
+        pipeline = self.make_pipeline(ScriptedVAD({2: {"start": 512}, 4: {"end": 1800}}))
         samples = np.arange(2400, dtype=np.float32) / 2400
         for start, end in ((0, 300), (300, 1400), (1400, 2400)):
             pipeline.push(audio_frame(samples[start:end], offset=start))
         self.finish(pipeline)
-        captured = np.concatenate([call.args[0] for call in diarization.push.call_args_list])
-        np.testing.assert_array_equal(captured, samples)
-        diarization.finish.assert_called()
         timing = pipeline.snapshot()["timings"][0]
         self.assertEqual((timing["start_s"], timing["end_s"]), (512 / SAMPLE_RATE, 1800 / SAMPLE_RATE))
         self.assertGreaterEqual(timing["asr_final_ms"], timing["asr_start_ms"])
@@ -320,12 +332,90 @@ class LiveTranscriberTests(unittest.TestCase):
             self.finish(pipeline)
 
         snapshot = pipeline.snapshot()
-        self.assertIn("decode broke", snapshot["error"])
+        self.assertIn("Transcription failed", snapshot["error"])
+        self.assertNotIn("decode broke", snapshot["error"])
         self.assertFalse(snapshot["accepting"])
         self.assertEqual(snapshot["texts"], [])
         self.assertEqual(snapshot["pending"], 0)
         gc.collect()
         self.assertIsNone(references[0](), "failed speech is still retained")
+
+    def test_result_callback_starts_translation_without_polling_and_outside_lock(self):
+        delivered = Event()
+        received = []
+
+        def observer(texts, snapshot):
+            received.append((texts.copy(), snapshot["timings"][0]["start_s"]))
+            # A callback can safely obtain state and cannot mutate the transcript.
+            self.assertEqual(pipeline.snapshot()["texts"], texts)
+            texts.append("external mutation")
+            delivered.set()
+
+        pipeline = self.make_pipeline(
+            ScriptedVAD({1: {"start": 0}, 2: {"end": 700}}), on_result=observer,
+        )
+        pipeline.push(audio_frame(np.ones(1024)))
+        self.assertTrue(delivered.wait(5))
+        self.assertEqual(received, [(["segment 1"], 0)])
+        self.assertEqual(pipeline.snapshot()["texts"], ["segment 1"])
+
+    def test_close_ignores_late_result_discards_queue_and_closes_client_once(self):
+        started, release = Event(), Event()
+        callback = Mock()
+
+        def transcribe(samples):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return "late result"
+
+        transcribe.close = Mock()
+        pipeline = self.make_pipeline(
+            ScriptedVAD({1: {"start": 0}}), transcribe=transcribe,
+            max_segment_seconds=512 / SAMPLE_RATE, on_result=callback,
+        )
+        self.addCleanup(release.set)
+        pipeline.push(audio_frame(np.ones(2048)))
+        self.assertTrue(started.wait(5))
+        pipeline.close()
+        pipeline.close()
+        release.set()
+        self.finish(pipeline)
+        self.assertEqual(pipeline.snapshot()["texts"], [])
+        self.assertEqual(pipeline.snapshot()["pending"], 0)
+        callback.assert_not_called()
+        transcribe.close.assert_called_once()
+
+    def test_finish_without_audio_closes_endpoint_client(self):
+        client = Mock()
+        pipeline = self.make_pipeline(ScriptedVAD(), transcribe=client)
+        self.finish(pipeline)
+        self.finish(pipeline)
+        client.close.assert_called_once()
+
+    def test_close_tolerates_worker_dequeuing_last_item_during_drain(self):
+        client = Mock()
+        pipeline = self.make_pipeline(ScriptedVAD(), transcribe=client)
+        # Simulate a stale nonempty observation followed by another consumer
+        # removing the last item. Queue.get_nowait is authoritative.
+        with patch.object(pipeline._queue, "empty", return_value=False), \
+                patch.object(pipeline._queue, "get_nowait", side_effect=Empty):
+            pipeline.close()
+        self.assertEqual(pipeline.snapshot()["pending"], 0)
+        self.assertTrue(pipeline.snapshot()["finished"])
+        client.close.assert_called_once()
+
+    def test_worker_start_failure_closes_client_and_reports_safe_terminal_error(self):
+        client = Mock()
+        pipeline = self.make_pipeline(ScriptedVAD(), transcribe=client)
+        with patch.object(pipeline._worker, "start", side_effect=RuntimeError("private details")), \
+                self.assertLogs("src.pipeline", level="ERROR") as logs:
+            pipeline.push(audio_frame(np.zeros(FRAME_SIZE)))
+        state = pipeline.snapshot()
+        self.assertTrue(state["finished"])
+        self.assertFalse(state["accepting"])
+        self.assertIn("Audio processing failed", state["error"])
+        self.assertNotIn("private details", str(logs.output) + state["error"])
+        client.close.assert_called_once()
 
     def test_vad_failure_is_visible_and_worker_stops(self):
         def vad(chunk):
@@ -337,7 +427,7 @@ class LiveTranscriberTests(unittest.TestCase):
             self.finish(pipeline)
 
         snapshot = pipeline.snapshot()
-        self.assertIn("VAD broke", snapshot["error"])
+        self.assertIn("Audio processing failed", snapshot["error"])
         self.assertFalse(snapshot["accepting"])
         self.assertEqual(snapshot["pending"], 0)
 

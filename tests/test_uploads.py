@@ -11,7 +11,9 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
-from src.uploads import MAX_SEGMENT_SECONDS, SAMPLE_RATE, decode_wav, speech_segments
+from src.uploads import (
+    MAX_SEGMENT_SECONDS, SAMPLE_RATE, decode_wav, speech_segments, transcribe_in_background,
+)
 
 
 def audio_bytes(samples, sample_rate=SAMPLE_RATE, *, format="WAV", subtype="FLOAT"):
@@ -220,6 +222,36 @@ class SpeechSegmentsTests(unittest.TestCase):
         self.assertEqual([len(segment) for segment in segments], [limit, limit, 173])
         np.testing.assert_array_equal(np.concatenate(segments), audio[100:])
         self.assertTrue(all(np.shares_memory(segment, audio) for segment in segments))
+
+
+class BackgroundUploadTests(unittest.TestCase):
+    def test_completion_dispatches_translation_before_ui_consumes_future(self):
+        received = []
+        future = transcribe_in_background(
+            lambda audio: "你好", np.zeros(512, dtype=np.float32),
+            on_result=lambda text, start, end: received.append((text, start, end)),
+        )
+        result = future.result(timeout=5)
+        self.assertEqual(received, [result])
+        self.assertGreaterEqual(result[2], result[1])
+
+    def test_callback_failure_does_not_lose_transcript_or_leak_error(self):
+        def callback(*args):
+            raise RuntimeError("secret credential")
+
+        with self.assertLogs("src.uploads", level="ERROR") as logs:
+            future = transcribe_in_background(lambda audio: "hello", np.zeros(512), on_result=callback)
+            self.assertEqual(future.result(timeout=5)[0], "hello")
+        self.assertNotIn("secret credential", str(logs.output))
+
+    def test_endpoint_error_is_sanitized(self):
+        def transcribe(audio):
+            raise RuntimeError("Authorization: Bearer secret credential")
+
+        future = transcribe_in_background(transcribe, np.zeros(512))
+        with self.assertRaisesRegex(RuntimeError, "Check the ASR endpoint") as error:
+            future.result(timeout=5)
+        self.assertNotIn("secret credential", str(error.exception))
 
 
 if __name__ == "__main__":

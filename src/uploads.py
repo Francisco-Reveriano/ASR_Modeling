@@ -1,5 +1,6 @@
-"""Prepare uploaded WAV audio for sequential transcription with local Breeze."""
+"""Prepare uploaded WAV audio for sequential transcription with hosted ASR."""
 
+import logging
 from io import BytesIO
 from math import gcd
 from concurrent.futures import Future
@@ -15,25 +16,37 @@ from src.pipeline import SAMPLE_RATE, SPEECH_PAD_MS
 
 MAX_SEGMENT_SECONDS = 15
 WAV_BLOCK_FRAMES = 65_536
+logger = logging.getLogger(__name__)
 
 
-def transcribe_in_background(transcribe, audio):
+def transcribe_in_background(transcribe, audio, *, on_result=None):
     """Return one reusable decode task while the UI polls completed translations.
 
     The upload job retains this Future across Streamlit reruns. Only its owner
     appends the result, so an interrupted UI run neither repeats ASR nor lets an
-    old task write into a replacement session. The ASR callable still acquires
-    the shared local-model lock; this worker never loads or calls translators.
+    old task write into a replacement session. on_result(text, start_ms, end_ms)
+    runs before the Future is published, allowing translation to start without a
+    UI rerun. It must capture its owning session, never Streamlit session state.
+    The caller owns the endpoint client and closes it after all upload segments.
     """
     future = Future()
 
     def run():
+        if not future.set_running_or_notify_cancel():
+            return
         try:
             started = monotonic() * 1000
             text = transcribe(audio)
-            future.set_result((text, started, monotonic() * 1000))
-        except Exception as exc:
-            future.set_exception(exc)
+            finished = monotonic() * 1000
+            if on_result is not None and text:
+                try:
+                    on_result(text, started, finished)
+                except Exception:
+                    logger.error("Upload transcript observer failed")
+            future.set_result((text, started, finished))
+        except Exception:
+            # Endpoint exception bodies/URLs may contain credentials.
+            future.set_exception(RuntimeError("Transcription failed. Check the ASR endpoint and retry the file."))
 
     Thread(target=run, daemon=True, name="upload-transcription").start()
     return future
@@ -108,7 +121,7 @@ def speech_segments(audio: np.ndarray, vad, *, with_timestamps=False) -> list:
     for speech in timestamps:
         start = max(0, speech["start"])
         end = min(len(audio), speech["end"])
-        # Keep Breeze's input bounded even if a VAD span exceeds its limit.
+        # Keep hosted ASR input bounded even if a VAD span exceeds its limit.
         for offset in range(start, end, max_samples):
             stop = min(offset + max_samples, end)
             samples = audio[offset:stop]

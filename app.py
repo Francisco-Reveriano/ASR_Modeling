@@ -12,39 +12,27 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from src.evaluation import mixed_match_score, parse_reference, word_match_score
 from src.glossary import load_glossary
-from src.pipeline import LiveTranscriber, load_transcriber, load_vad
-from src.reasoning import (
-    PROMPT_VERSION, correct_translations, correction_output_token_limit, correction_settings,
-)
+from src.pipeline import LiveTranscriber, load_vad
 from src.reference_tables import (
     parsed_table_reference, read_reference_tables, recommend_columns,
     suggest_header_row, suggest_table, table_columns,
 )
-from src.tencent import TENCENT_ERROR_MESSAGE, translate_with_tencent
-from src.translation import ENV_FILE, TranslationSession, background_filter_enabled
-from src.slow_lane import SlowLaneConfig, SlowLaneSession
-from src.conversation_review import ConversationReviewSession
-from src.diarization import DiarizationSession, speaker_labels
-from src.subtitle_exports import export_bilingual_csv, export_captions
+from src.translation import TranslationSession
+from src.subtitle_exports import conversation_records, export_bilingual_csv, export_captions
 from src.ui import export_conversation, render_transcript
 from src.uploads import decode_wav, speech_segments, transcribe_in_background
+from src.vllm import (
+    VllmConfigError, create_asr, create_translator, default_fast_profile,
+    load_asr_config, load_fast_profiles,
+)
 
-TRANSLATION_TYPES = {
-    "Compare all translations": (("openai", "tencent", "astra"), True),
-    "Fast English": (("openai",), False),
-    "Corrected English": (("openai", "astra"), False),
-    "Fully reviewed English": (("openai", "astra"), True),
-}
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 
-st.set_page_config(page_title="Breeze Voice", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="vLLM Voice", page_icon="🎙️", layout="wide")
 st.html(Path(__file__).parent / "assets" / "style.css")
 st.markdown(
-    '<div class="brand-bar"><div class="brand">'
-    '<svg viewBox="0 0 32 32" fill="none" stroke="currentColor" '
-    'stroke-width="3" stroke-linecap="round" aria-hidden="true">'
-    '<path d="M4 13v6M10 8v16M16 4v24M22 10v12M28 14v4"/></svg>'
-    'breeze <span>/ voice</span></div>'
-    '<div class="local-badge">Breeze + Tencent on this Mac · OpenAI via API</div></div>',
+    '<div class="brand-bar"><div class="brand">vLLM <span>/ voice</span></div>'
+    '<div class="local-badge">Local speech detection · vLLM transcription & translation</div></div>',
     unsafe_allow_html=True,
 )
 st.title("Voice transcription & translation")
@@ -54,178 +42,97 @@ st.markdown(
 )
 
 
-@st.cache_resource(show_spinner=False)
-def get_transcriber():
-    return load_transcriber()
+def close_conversation():
+    """Close captured workers before replacing their conversation state."""
+    recording = st.session_state.pop("recording", None)
+    if recording is not None:
+        recording.close()
+    job = st.session_state.pop("upload_job", None)
+    if job is not None and job.get("transcribe") is not None:
+        job["transcribe"].close()
+    translation = st.session_state.pop("translation", None)
+    if translation is not None:
+        translation.close()
+    for key in ("upload_state", "transcript_source", "conversation_config", "microphone_context",
+                "model_error", "upload_error", "evaluation_error", "recording_ice"):
+        st.session_state.pop(key, None)
 
 
-def slow_config():
-    """Freeze the controls into the new session's reproducible configuration."""
-    model, reasoning_effort = correction_settings()
-    return SlowLaneConfig(
-        model=model, reasoning_effort=reasoning_effort,
-        filter_background_speech=background_filter_enabled(),
-        max_output_tokens=st.session_state.get("slow_max_tokens", correction_output_token_limit()),
-        confidence_threshold=st.session_state.get("slow_confidence", 0.6),
-        source_lang="zh-TW+en", target_lang="en",
-        enabled=st.session_state.get("enable_corrections", True),
-    )
-
-
-def terminology():
-    if "glossary" not in st.session_state:
-        st.session_state.glossary = load_glossary(
-            st.session_state.get("glossary_path") or None,
-            st.session_state.get("dnt_path") or None,
-        )
-    return st.session_state.glossary
-
-
-def translation_configuration(name="Compare all translations"):
-    """Return the provider choices frozen when a conversation starts."""
-    providers, second_review = TRANSLATION_TYPES[name]
-    return {"type": name, "providers": providers, "second_review": second_review}
-
-
-def current_translation_configuration():
-    return st.session_state.get("translation_config", translation_configuration())
-
-
-def new_review_session(config, glossary, selected):
-    session_type = ConversationReviewSession if selected["second_review"] else SlowLaneSession
-    return session_type(correct_translations, config=config, glossary=glossary)
-
-
-def ensure_review_session(texts):
-    selected = current_translation_configuration()
-    if "astra" not in selected["providers"]:
+def terminology_path(value):
+    """Resolve optional local terminology files independently of launch cwd."""
+    if not value or not value.strip():
         return None
-    if texts and "slow_lane" not in st.session_state:
-        st.session_state.slow_lane = new_review_session(slow_config(), terminology(), selected)
-    return st.session_state.get("slow_lane")
+    path = Path(value.strip())
+    return path if path.is_absolute() else ENV_FILE.parent / path
 
 
-def correction_callback(lane):
-    """Bind fast results to their own conversation without worker UI access."""
-    def on_result(texts, result):
-        lane.submit(
-            texts, result["translations"], draft_errors=result.get("errors", []),
-            draft_filtered=result.get("filtered", []), allow_prefix=True,
+def prepare_conversation():
+    """Validate and create a selected translator before replacing usable results."""
+    load_dotenv(ENV_FILE, override=False)
+    asr = load_asr_config()
+    profiles = load_fast_profiles()
+    alias = st.session_state.get("next_fast_profile", default_fast_profile(profiles))
+    if alias not in profiles:
+        raise VllmConfigError("Choose a configured translation model, then retry.")
+    profile = profiles[alias]
+    glossary = load_glossary(
+        terminology_path(st.session_state.get("glossary_path")),
+        terminology_path(st.session_state.get("dnt_path")),
+    )
+    translator = create_translator(profile)
+    try:
+        translation = TranslationSession(
+            translator, contextual=True, owned_client=True, glossary=glossary,
         )
+    except Exception:
+        translator.close()
+        raise
+    return {"asr": asr, "fast": profile, "alias": alias}, translation
+
+
+def activate_conversation(config, translation):
+    close_conversation()
+    st.session_state.conversation_config = config
+    st.session_state.translation = translation
+
+
+def translation_callback(translation):
+    """Capture a worker, never Streamlit state, for immediate ASR publication."""
+    def on_result(texts, _snapshot):
+        translation.submit(texts)
     return on_result
 
 
-def reset_translation(*, translation_type="Compare all translations", diarization_max_pending_seconds=600):
-    """End old work and allocate independent fast, slow, and speaker workers."""
-    # Load configured files before closing a usable previous session. File I/O
-    # never runs on the audio, translator, or correction worker's critical path.
-    glossary = load_glossary(
-        st.session_state.get("glossary_path") or None,
-        st.session_state.get("dnt_path") or None,
-    )
-    selected = translation_configuration(translation_type)
-    config = slow_config() if "astra" in selected["providers"] else None
-    for key in ("translation", "tencent_translation", "slow_lane", "diarization"):
-        previous = st.session_state.pop(key, None)
-        if previous is not None:
-            previous.close()
-    st.session_state.glossary = glossary
-    st.session_state.translation_config = selected
-    lane = new_review_session(config, glossary, selected) if config is not None else None
-    if lane is not None:
-        st.session_state.slow_lane = lane
-    st.session_state.translation = TranslationSession(
-        glossary=glossary, on_result=correction_callback(lane) if lane is not None else None,
-    )
-    if "tencent" in selected["providers"]:
-        st.session_state.tencent_translation = TranslationSession(
-            translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
-        )
-    st.session_state.diarization = DiarizationSession(
-        enabled=st.session_state.get("enable_diarization", True),
-        max_pending_seconds=diarization_max_pending_seconds,
-    )
+def upload_translation_callback(translation, texts):
+    prefix = tuple(texts)
+
+    def on_result(text, _started, _finished):
+        if text:
+            translation.submit([*prefix, text])
+    return on_result
 
 
-def conversation_metadata(state, texts):
-    """Copy available audio offsets and speaker labels on the Streamlit thread."""
-    original_timings = state.get("timings", []) if state else []
-    timings = [dict(original_timings[index]) if index < len(original_timings) and original_timings[index] else {}
-               for index in range(len(texts))]
-    diarization = st.session_state.get("diarization")
-    speakers = None
-    if diarization is not None:
-        # Legacy sessions have no audio offsets. Keep their speaker unknown
-        # rather than inventing a timeline from transcript or reference rows.
-        speakers = speaker_labels(
-            [timing if "start_s" in timing and "end_s" in timing else None for timing in timings],
-            diarization.snapshot()["segments"],
-        )
-        for timing, speaker in zip(timings, speakers):
-            if speaker is not None:
-                timing["speaker_id"] = speaker
-    return timings, speakers
-
-
-def conversation_extras(state, texts, translated):
-    """Refresh metadata and retain polling recovery for fast-result observers."""
-    lane = ensure_review_session(texts)
-    timings, speakers = conversation_metadata(state, texts)
-    if lane is not None:
-        lane.submit(
-            texts, translated["openai"]["translations"],
-            draft_errors=translated["openai"]["errors"], timings=timings,
-            draft_filtered=translated["openai"].get("filtered", []),
-        )
-        slow = lane.snapshot()
-    else:
-        slow = {"translations": [], "statuses": [], "authoritative": [],
-                "segments": [], "pending": 0, "status": "idle", "metrics": {}}
-    slow["view"] = "authoritative" if st.session_state.get("subtitle_view") == "Final record" else "speculative"
-    return {"slow_lane": slow, "speakers": speakers,
-            "providers": current_translation_configuration()["providers"]}
-
-
-def translation_snapshot(texts, state=None):
-    """Send the same original text to independent cloud and local workers.
-
-    Neither translator consumes the other's output or waits for it. Each queue
-    deduplicates segment positions across UI polls. Creating a missing provider
-    independently also preserves existing results after an app update.
-    """
-    providers = current_translation_configuration()["providers"]
-    lane = ensure_review_session(texts)
-    if texts and "translation" not in st.session_state:
-        st.session_state.translation = TranslationSession(
-            glossary=terminology(), on_result=correction_callback(lane) if lane is not None else None,
-        )
-    if texts and "tencent" in providers and "tencent_translation" not in st.session_state:
-        st.session_state.tencent_translation = TranslationSession(
-            translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
-        )
-    if texts and lane is not None:
-        # A fast result can arrive before the next UI refresh. Seed source and
-        # available metadata before starting its provider, then let the captured
-        # lane callback publish completed drafts without waiting for a poll.
-        timings, _ = conversation_metadata(state, texts)
-        lane.submit(texts, [], timings=timings)
-    results = {}
-    for provider, key in (("openai", "translation"), ("tencent", "tencent_translation")):
-        translation = st.session_state.get(key) if provider in providers else None
-        if translation is None:
-            results[provider] = {"translations": [], "errors": [], "pending": 0}
-        else:
-            translation.submit(texts)
-            results[provider] = translation.snapshot()
-    return results
+def translation_snapshot(texts):
+    translation = st.session_state.get("translation")
+    if translation is None:
+        return {"translations": [], "errors": [], "filtered": [], "pending": 0}
+    translation.submit(texts, allow_prefix=True)
+    return translation.snapshot()
 
 
 def conversation_args(texts, translated):
-    """Keep rendering and downloads on the same source/provider ordering."""
-    return (
-        texts, translated["openai"]["translations"], translated["openai"]["errors"],
-        translated["tencent"]["translations"], translated["tencent"]["errors"],
-    )
+    return texts, translated["translations"], translated["errors"]
+
+
+def conversation_extras(state, translated):
+    config = st.session_state.get("conversation_config")
+    profile = config["fast"] if config else None
+    return {
+        "filtered": translated.get("filtered", []),
+        "timings": state.get("timings", []) if state else [],
+        "profile_label": profile.label if profile else "Fast English",
+        "model": profile.model if profile else None,
+    }
 
 
 def reference_view_args(state):
@@ -249,19 +156,19 @@ def reference_description(reference):
 
 
 def evaluation_references(evaluation):
-    """Return the source reference used to score Breeze transcription."""
+    """Return the source reference used to score ASR transcription."""
     primary = evaluation.get("reference") or {
         "text": evaluation["reference_text"], "name": evaluation["reference_name"],
         "has_cjk": False, "format": "Plain text",
     }
     if evaluation.get("reference_kind", "english") == "source":
-        return {"breeze": primary}
+        return {"asr": primary}
     # A previously submitted translation reference cannot grade source speech.
-    return {"breeze": None}
+    return {"asr": None}
 
 
 def evaluation_results(state):
-    """Score the complete Breeze transcript; translators are never scored.
+    """Score the complete ASR transcript; translators are never scored.
 
     The reference belongs to the submitted job and is never passed to a model.
     Cache completed alignments in this session so polling does not recalculate
@@ -273,7 +180,7 @@ def evaluation_results(state):
     for provider, reference in evaluation_references(evaluation).items():
         mixed = reference is not None and reference["has_cjk"]
         result = {
-            "label": "Breeze",
+            "label": "ASR",
             "metric": "Mixed match" if mixed else "1-wMER", "metrics": None,
         }
         if reference is None:
@@ -296,7 +203,7 @@ def evaluation_results(state):
 
 
 def evaluation_panel(state, results):
-    """Show Breeze's whole-file transcription score."""
+    """Show ASR's whole-file transcription score."""
     st.markdown('<h3 class="evaluation-heading">Transcription score</h3>', unsafe_allow_html=True)
     st.caption("Reference match · Higher is better")
     columns = st.columns(len(results), gap="medium")
@@ -316,7 +223,7 @@ def evaluation_panel(state, results):
                 )
     with st.expander("Reference & scoring details"):
         references = evaluation_references(state["evaluation"])
-        for provider in ("breeze",):
+        for provider in ("asr",):
             reference = references.get(provider)
             if reference is not None:
                 st.caption(f"Source transcript: {reference_description(reference)} · {reference['format']}")
@@ -341,7 +248,7 @@ def evaluation_panel(state, results):
 def evaluation_report(state, results):
     """Include final scores or explicit pending/failure states in the TXT export."""
     lines = [
-        "Evaluation: Breeze transcription score",
+        "Evaluation: ASR transcription score",
         f"Audio: {state['name']}",
         "Scoring: whole-file alignment; Unicode normalized; case/punctuation ignored.",
         "Formula: matches / (matches + substitutions + deletions + insertions)",
@@ -377,89 +284,30 @@ def evaluation_report(state, results):
     return "\n".join(lines)
 
 
-def correction_status(slow):
-    """Show review progress and recovery only for a selected correction lane."""
-    slow_status = slow["status"]
-    active_reviews = slow.get("active_reviews", slow.get("pending", 0))
-    queued_reviews = max(0, slow.get("pending", 0) - active_reviews)
-    review_progress = f"{active_reviews} segment(s) under review"
-    if queued_reviews:
-        review_progress += f" · {queued_reviews} awaiting review"
-    status_caption = {
-        "active": f"Astra · {review_progress}",
-        "paused": "Astra · Corrections paused · Fast translations continue",
-        "degraded": "Astra · Some reviews need retry · Fast translations continue",
-        "closed": "Astra · Session ended",
-        "idle": "Astra · Ready",
-    }.get(slow_status, "Astra")
-    if slow_status == "degraded" and slow.get("pending"):
-        status_caption += f" · {review_progress}"
-    if slow.get("config"):
-        config = slow["config"]
-        status_caption += f" · {config['model']} · {config['reasoning_effort'].capitalize()} reasoning"
-    st.caption(status_caption)
-    conversation_review = slow.get("conversation_review", {})
-    if conversation_review.get("enabled"):
-        reviewed, total = conversation_review.get("reviewed", 0), conversation_review.get("total", 0)
-        progress = f"Conversation review {reviewed}/{total}"
-        if conversation_review.get("status") == "degraded":
-            progress += " · Needs retry"
-        elif conversation_review.get("status") == "paused":
-            progress += " · Paused"
-        elif conversation_review.get("active_reviews"):
-            progress += " · Reviewing"
-        elif conversation_review.get("pending"):
-            progress += " · Waiting for earlier reviews"
-        elif total and reviewed == total:
-            progress += " · Complete"
-        st.caption(progress)
-    if slow_status == "degraded" and st.button("Retry open corrections", key="retry_corrections"):
-        st.session_state.slow_lane.retry_failed()
-        st.rerun()
-    review_errors = list(dict.fromkeys(
-        segment["error"] for segment in slow.get("segments", []) if segment.get("error")
-    ))
-    if review_errors:
-        st.warning("Astra: " + " ".join(review_errors))
-    conversation_errors = list(dict.fromkeys(
-        segment["conversation_review_error"] for segment in slow.get("segments", [])
-        if segment.get("conversation_review_error")
-    ))
-    if conversation_errors:
-        st.warning("Conversation review: " + " ".join(conversation_errors))
-
-
 def transcript_panel(state=None, context=None):
-    """Draw the current snapshot without changing the recording session."""
+    """Render source and the one frozen English profile, without model calls."""
     texts = state["texts"] if state else []
-    translated = translation_snapshot(texts, state)
-    extras = conversation_extras(state, texts, translated)
-    translation_pending = any(result["pending"] for result in translated.values())
-    translation_failed = any(any(result["errors"]) for result in translated.values())
+    translated = translation_snapshot(texts)
+    extras = conversation_extras(state, translated)
     is_upload = state is not None and "name" in state
     is_evaluation = state is not None and "evaluation" in state
     status, tone = "Ready", ""
+    playing = bool(context and context.state.playing)
     if state:
         if state["error"]:
             status = "Needs attention"
         elif state["pending"]:
             status, tone = "Transcribing…", "working"
         elif state["accepting"]:
-            status, tone = (
-                ("Listening…", "active") if context.state.playing
-                else ("Connecting microphone…", "working")
-            )
-        elif state["finished"]:
-            status = "Evaluation complete" if is_evaluation else (
-                "File transcribed" if is_upload else "Recording stopped"
-            )
-        else:
+            status, tone = ("Listening…", "active") if playing else ("Connecting microphone…", "working")
+        elif not state["finished"]:
             status, tone = "Finishing…", "working"
-    if translation_pending and state and state["finished"] and not state["error"]:
-        status, tone = "Translating…", "working"
-    elif translation_failed and state and state["finished"]:
-        status, tone = "Needs attention", ""
-
+        elif translated["pending"]:
+            status, tone = "Translating…", "working"
+        elif any(translated["errors"]):
+            status = "Needs attention"
+        else:
+            status = "Evaluation complete" if is_evaluation else "File transcribed" if is_upload else "Recording stopped"
     heading = "Evaluation results" if is_evaluation else "Your conversation"
     st.markdown(
         f'<div class="transcript-heading"><h2>{heading}</h2>'
@@ -469,83 +317,54 @@ def transcript_panel(state=None, context=None):
     if state and state["error"]:
         st.error(state["error"])
     if is_upload:
-        st.markdown(
-            f'<p class="source-file">File: {escape(state["name"])}</p>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<p class="source-file">File: {escape(state["name"])}</p>', unsafe_allow_html=True)
     if state and state["pending"]:
         action = "Listening and transcribing" if state["accepting"] else "Finishing transcription"
         st.caption(f"{action} · {state['pending']} segment(s) pending")
-    elif state and state["accepting"] and not context.state.playing:
+    elif state and state["accepting"] and not playing:
         st.caption("If the connection stalls, open Microphone settings to check browser access.")
     if state and state["finished"] and not texts and not state["error"]:
-        st.info(
-            "No speech detected in this file. Try another WAV file."
-            if is_upload else "No speech detected. Start a new recording to try again."
-        )
-
-    for provider, label, key, retry_key in (
-        ("openai", "OpenAI", "translation", "retry_translation"),
-        ("tencent", "Tencent · Local", "tencent_translation", "retry_tencent_translation"),
-    ):
-        if provider not in extras["providers"]:
-            continue
-        result = translated[provider]
-        if result["pending"]:
-            st.caption(f"{label} · Translating {result['pending']} segment(s) into English")
-        errors = list(dict.fromkeys(error for error in result["errors"] if error))
-        if errors:
-            st.warning(f"{label}: {' '.join(errors)}")
-            if st.button(f"Retry {label}", key=retry_key, icon=":material/refresh:"):
-                st.session_state[key].retry_failed()
-                st.rerun()
+        st.info("No speech detected in this file. Try another WAV file." if is_upload
+                else "No speech detected. Start a new recording to try again.")
+    if translated["pending"]:
+        st.caption(f"{extras['profile_label']} · Translating {translated['pending']} segment(s) into English")
+    errors = list(dict.fromkeys(error for error in translated["errors"] if error))
+    if errors:
+        st.warning(" ".join(errors))
+        if st.button("Retry translation", key="retry_translation", icon=":material/refresh:"):
+            st.session_state.translation.retry_failed()
+            st.rerun()
     if is_evaluation:
         results = evaluation_results(state)
         evaluation_panel(state, results)
-    slow = extras["slow_lane"]
-    slow_status = slow["status"]
-    if "astra" in extras["providers"]:
-        correction_status(slow)
-    diarization = st.session_state.get("diarization")
-    if diarization is not None:
-        speaker_state = diarization.snapshot()
-        st.caption(f"Nemotron · Speaker detection {speaker_state['status']}")
-        if speaker_state.get("error"):
-            st.caption(speaker_state["error"])
-    st.markdown(
-        render_transcript(*conversation_args(texts, translated), **extras, **reference_view_args(state)),
-        unsafe_allow_html=True,
-    )
-    download_text = export_conversation(*conversation_args(texts, translated), **extras)
+    args = conversation_args(texts, translated)
+    st.markdown(render_transcript(*args, **extras, **reference_view_args(state)), unsafe_allow_html=True)
+    download_text = export_conversation(*args, **extras)
     if is_evaluation:
         download_text += "\n\n" + evaluation_report(state, results)
-    if slow.get("segments"):
-        with st.expander("Correction history & session export"):
-            st.caption(
-                "Accepted corrections replace the Astra draft and show Corrected when review finishes. "
-                "Unchanged reviews show Confirmed. The first review is retained in the audit; "
-                "the latest accepted review appears in the transcript and exports."
-            )
-            st.json({"status": slow_status, "metrics": slow.get("metrics", {}),
-                     "config": slow.get("config", {}), "learned_terms": slow.get("learned_terms", [])})
-            record = dict(slow, prompt_version=PROMPT_VERSION,
-                          translation_config=current_translation_configuration())
-            if diarization is not None:
-                record["diarization"] = speaker_state
+    if texts:
+        with st.expander("Session exports"):
+            config = st.session_state["conversation_config"]
+            record = {
+                "config": {"asr": config["asr"].public(), "translation": config["fast"].public(),
+                           "profile": config["alias"]},
+                "segments": conversation_records(*args, **extras),
+                "asr_finished": state["finished"], "asr_failed": bool(state["error"]),
+            }
             st.download_button(
                 "Download session JSON", json.dumps(record, ensure_ascii=False, indent=2),
-                "breeze-session.json", "application/json", key="download_session", on_click="ignore",
+                "vllm-session.json", "application/json", key="download_session", on_click="ignore",
             )
             st.download_button(
-                "Download final bilingual CSV", export_bilingual_csv(slow, speakers=extras["speakers"]),
-                "breeze-final.csv", "text/csv", key="download_final_csv", on_click="ignore",
+                "Download bilingual CSV", export_bilingual_csv(*args, **extras),
+                "vllm-transcript.csv", "text/csv", key="download_csv", on_click="ignore",
             )
             for caption_format in ("srt", "vtt"):
-                captions = export_captions(slow, format=caption_format, speakers=extras["speakers"])
+                captions = export_captions(*args, format=caption_format, **extras)
                 st.download_button(
-                    f"Download final {caption_format.upper()}", captions, f"breeze-final.{caption_format}",
-                    "text/vtt" if caption_format == "vtt" else "text/plain",
-                    disabled=not captions, key=f"download_final_{caption_format}", on_click="ignore",
+                    f"Download {caption_format.upper()}", captions, f"vllm-transcript.{caption_format}",
+                    "text/vtt" if caption_format == "vtt" else "text/plain", disabled=not captions,
+                    key=f"download_{caption_format}", on_click="ignore",
                 )
     with st.container(key="transcript_footer"):
         count_column, download_column = st.columns([1, 1], vertical_alignment="center")
@@ -555,107 +374,115 @@ def transcript_panel(state=None, context=None):
             unsafe_allow_html=True,
         )
         download_column.download_button(
-            "Download evaluation" if is_evaluation else "Download conversation",
-            data=download_text,
-            file_name="breeze-evaluation.txt" if is_evaluation else "breeze-conversation.txt",
-            mime="text/plain",
-            icon=":material/download:",
-            disabled=not texts and not is_evaluation,
-            on_click="ignore",
-            width="stretch",
-            wrap=True,
-            key="download_transcript",
+            "Download evaluation" if is_evaluation else "Download conversation", data=download_text,
+            file_name="vllm-evaluation.txt" if is_evaluation else "vllm-conversation.txt", mime="text/plain",
+            icon=":material/download:", disabled=not texts and not is_evaluation, on_click="ignore",
+            width="stretch", wrap=True, key="download_transcript",
         )
 
 
 @st.fragment(run_every=0.5)
 def show_transcript(session=None, context=None, control_state=None):
-    """Poll ASR and translation for either input, including after audio stops."""
     state = session.snapshot() if session else st.session_state.upload_state
     if session and (state["accepting"], state["finished"]) != control_state:
-        # Refresh controls only when capture ends or the worker finishes.
         st.rerun()
     transcript_panel(state, context)
 
 
-def recording_panel():
+def webrtc_ice_servers():
+    """Read explicit browser ICE settings without exposing TURN credentials."""
+    message = "WEBRTC_ICE_SERVERS_JSON must be a JSON array of ICE servers with urls and optional username/credential."
+    try:
+        servers = json.loads(os.getenv("WEBRTC_ICE_SERVERS_JSON", "").strip() or "[]")
+        if not isinstance(servers, list):
+            raise ValueError()
+        for server in servers:
+            if not isinstance(server, dict) or set(server) - {"urls", "username", "credential"}:
+                raise ValueError()
+            urls = server.get("urls")
+            urls = [urls] if isinstance(urls, str) else urls
+            if not isinstance(urls, list) or not urls:
+                raise ValueError()
+            if any(not isinstance(url, str) or ":" not in url
+                   or url.split(":", 1)[0] not in {"stun", "stuns", "turn", "turns"}
+                   or not url.split(":", 1)[1] or any(character.isspace() for character in url)
+                   for url in urls):
+                raise ValueError()
+            if any(not isinstance(server[key], str) for key in ("username", "credential") if key in server):
+                raise ValueError()
+        return servers
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+
+
+def recording_panel(configuration_ready):
     session = st.session_state.get("recording")
     context = st.session_state.get("microphone_context")
     state = session.snapshot() if session else None
     browser_active = context and (context.state.playing or context.state.signalling)
-    busy = bool(
-        browser_active or (state and not state["finished"])
-        or st.session_state.get("upload_job") is not None
-    )
-
+    busy = bool(browser_active or (state and not state["finished"]) or st.session_state.get("upload_job") is not None)
+    try:
+        ice_servers = webrtc_ice_servers()
+    except ValueError as exc:
+        st.error(str(exc))
+        configuration_ready = False
+        ice_servers = []
     start_column, stop_column = st.columns(2)
     start = start_column.button(
-        "Start recording", disabled=busy, type="primary", icon=":material/mic:",
+        "Start recording", disabled=busy or not configuration_ready, type="primary", icon=":material/mic:",
         width="stretch", wrap=True, key="start_recording",
     )
     stop = stop_column.button(
-        "Stop recording", disabled=not state or not state["accepting"],
-        icon=":material/stop:", width="stretch", wrap=True, key="stop_recording",
+        "Stop recording", disabled=not state or not state["accepting"], icon=":material/stop:",
+        width="stretch", wrap=True, key="stop_recording",
     )
     if start:
         st.session_state.model_error = None
+        translation = transcribe = None
         try:
-            with st.spinner("Loading local speech models…"):
-                transcribe = get_transcriber()
+            config, translation = prepare_conversation()
+            with st.spinner("Preparing speech detection…"):
                 vad = load_vad()
-            reset_translation(translation_type=st.session_state.get(
-                "microphone_translation_type", "Compare all translations",
-            ))
-            session = LiveTranscriber(transcribe, vad, diarization=st.session_state.diarization)
+            transcribe = create_asr(config["asr"])
+            new_session = LiveTranscriber(transcribe, vad, on_result=translation_callback(translation))
         except Exception as exc:
-            st.session_state.model_error = f"Could not load the local speech models: {exc}"
+            if translation is not None:
+                translation.close()
+            if transcribe is not None:
+                transcribe.close()
+            st.session_state.model_error = str(exc) if isinstance(exc, VllmConfigError) else (
+                "Could not prepare speech processing. Check the vLLM configuration and local VAD, then retry."
+            )
         else:
+            activate_conversation(config, translation)
+            session = new_session
             st.session_state.recording = session
+            st.session_state.recording_ice = ice_servers
             st.session_state.recording_number = st.session_state.get("recording_number", 0) + 1
             st.session_state.microphone_connected = False
             st.session_state.transcript_source = "microphone"
-            st.session_state.pop("upload_state", None)
     if st.session_state.get("model_error"):
         st.error(st.session_state.model_error)
     if stop:
         session.finish()
-        # Controls above were rendered from the pre-stop state. An empty
-        # recording can finish synchronously, so no later fragment transition
-        # would otherwise unlock Start and the next-session settings.
         st.rerun()
-
-    st.caption(
-        "Start recording and allow microphone access in your browser. "
-        "A new recording clears the previous transcript."
-    )
-    # Keep the component mounted outside the polling fragment. Its device picker
-    # remains accessible without duplicating recording controls in the main view.
+    st.caption("Start recording and allow microphone access in your browser. A new recording clears the previous transcript.")
     with st.expander("Microphone settings", icon=":material/tune:"):
-        st.selectbox(
-            "Translation type", list(TRANSLATION_TYPES), key="microphone_translation_type",
-            disabled=busy or bool(session and not session.snapshot()["finished"]),
-            help="Applies to the next recording. Fast uses OpenAI; Corrected adds Astra; "
-                 "Fully reviewed adds a conversation review. Compare all also runs Tencent locally.",
-        )
         if session is None:
             st.caption("Microphone devices will be available after you start recording.")
         else:
             context = webrtc_streamer(
-                key=f"microphone-{st.session_state.recording_number}",
-                mode=WebRtcMode.SENDONLY,
+                key=f"microphone-{st.session_state.recording_number}", mode=WebRtcMode.SENDONLY,
                 desired_playing_state=session.snapshot()["accepting"],
                 media_stream_constraints={"video": False, "audio": True},
-                rtc_configuration={"iceServers": []},
-                audio_frame_callback=session.push,
-                on_audio_ended=session.finish,
-                async_processing=False,
+                rtc_configuration={"iceServers": st.session_state.get("recording_ice", [])},
+                audio_frame_callback=session.push, on_audio_ended=session.finish, async_processing=False,
             )
             st.session_state.microphone_context = context
             if context.state.playing:
                 st.session_state.microphone_connected = True
             elif st.session_state.microphone_connected and not context.state.signalling:
                 session.finish()
-
     return session, context
 
 
@@ -726,7 +553,7 @@ def reference_inputs(busy):
                 format_func=lambda index: labels[index], key="eval_text_column", disabled=busy,
                 placeholder="Choose the original-language transcript",
                 on_change=clear_reference_settings,
-                help="Breeze is scored against this column. For your sample, choose text_zh_TW.",
+                help="ASR is scored against this column. For your sample, choose text_zh_TW.",
             )
             display_choices = [None, *choices]
             display_column = st.selectbox(
@@ -775,7 +602,7 @@ def reference_inputs(busy):
             with st.expander("Preview English reference"):
                 with st.container(height=180):
                     st.text(view["text"])
-        st.caption("Breeze is scored against the spoken reference. A separate reference pane shows your selected text for comparison.")
+        st.caption("ASR is scored against the spoken reference. A separate reference pane shows your selected text for comparison.")
         return {
             "reference_text": reference["text"], "reference_name": uploaded.name,
             "reference_kind": "source", "reference": reference, "reference_view": view,
@@ -784,18 +611,15 @@ def reference_inputs(busy):
         return None, True, str(exc)
 
 
-def upload_panel(session, context, *, evaluate=False):
-    """Validate a chosen file, then rerun with controls disabled before ASR."""
+def upload_panel(session, context, configuration_ready, *, evaluate=False):
+    """Validate local inputs and freeze the shared profile only on submission."""
     state = session.snapshot() if session else None
-    live_busy = bool(
-        (context and (context.state.playing or context.state.signalling))
-        or (state and not state["finished"])
-    )
+    live_busy = bool((context and (context.state.playing or context.state.signalling)) or (state and not state["finished"]))
     busy = live_busy or st.session_state.get("upload_job") is not None
     error_key = "evaluation_error" if evaluate else "upload_error"
     uploaded = st.file_uploader(
-        "Evaluation audio (.wav)" if evaluate else "Choose a WAV file",
-        type=["wav"], key="eval_wav_file" if evaluate else "wav_file", disabled=busy,
+        "Evaluation audio (.wav)" if evaluate else "Choose a WAV file", type=["wav"],
+        key="eval_wav_file" if evaluate else "wav_file", disabled=busy,
         on_change=lambda: st.session_state.pop(error_key, None),
     )
     if uploaded is not None:
@@ -804,11 +628,9 @@ def upload_panel(session, context, *, evaluate=False):
     if evaluate:
         evaluation, has_reference, reference_error = reference_inputs(busy)
     if st.button(
-        "Run evaluation" if evaluate else "Transcribe file",
-        key="evaluate_file" if evaluate else "transcribe_file", type="primary",
-        icon=":material/analytics:" if evaluate else ":material/audio_file:",
-        width="stretch", wrap=True,
-        disabled=busy or uploaded is None or (evaluate and not has_reference),
+        "Run evaluation" if evaluate else "Transcribe file", key="evaluate_file" if evaluate else "transcribe_file",
+        type="primary", icon=":material/analytics:" if evaluate else ":material/audio_file:", width="stretch", wrap=True,
+        disabled=busy or not configuration_ready or uploaded is None or (evaluate and not has_reference),
     ):
         st.session_state[error_key] = None
         try:
@@ -816,24 +638,21 @@ def upload_panel(session, context, *, evaluate=False):
                 raise ValueError(reference_error)
             with st.spinner("Reading WAV audio…"):
                 audio = decode_wav(uploaded.getvalue())
-            reset_translation(diarization_max_pending_seconds=max(600, len(audio) / 16000 + 1))
+            config, translation = prepare_conversation()
         except (ValueError, OSError) as exc:
             st.session_state[error_key] = str(exc)
+        except Exception:
+            st.session_state[error_key] = "Could not prepare this file. Check the vLLM configuration and retry."
         else:
-            st.session_state.upload_job = {
-                "audio": audio, "name": uploaded.name, "next_segment": 0,
-            }
+            activate_conversation(config, translation)
+            st.session_state.upload_job = {"audio": audio, "next_segment": 0, "config": config}
             st.session_state.upload_state = {
-                "texts": [], "pending": 0, "accepting": False,
-                "finished": False, "error": None, "name": uploaded.name,
-                "timings": [],
+                "texts": [], "pending": 0, "accepting": False, "finished": False,
+                "error": None, "name": uploaded.name, "timings": [],
             }
-            st.session_state.diarization.push(audio)
-            st.session_state.diarization.finish()
             if evaluate:
                 st.session_state.upload_state["evaluation"] = evaluation
             st.session_state.transcript_source = "upload"
-            st.session_state.model_error = None
             st.rerun()
     error = reference_error or st.session_state.get(error_key)
     if error:
@@ -841,24 +660,13 @@ def upload_panel(session, context, *, evaluate=False):
     if live_busy:
         st.caption("Stop recording and wait for transcription to finish before uploading a file.")
     elif evaluate:
-        st.caption(
-            "Transcribe and translate the audio, then score the Breeze transcript against your reference. "
-            "Starting a new evaluation replaces the current results."
-        )
+        st.caption("Transcribe and translate the audio, then score the source transcript against your local reference.")
     else:
         st.caption("Preview your audio, then transcribe it. A new transcription replaces the current text.")
 
 
 def process_upload():
-    """Transcribe file segments in order, without filling the live audio queue.
-
-    The job was stored on the previous run so input controls are already
-    disabled. A checkpoint after each segment lets an interrupted Streamlit
-    run resume without dropping or repeating completed text. Completed jobs
-    are removed along with their audio and segment views; results retain only
-    text and metadata, and ordinary reruns and downloads never repeat inference.
-    No file or transcript is written to disk.
-    """
+    """Keep exactly one remote ASR task per local checkpoint across UI reruns."""
     job = st.session_state.upload_job
     state = st.session_state.upload_state
     st.markdown(
@@ -872,128 +680,87 @@ def process_upload():
                 job["segments"] = speech_segments(job["audio"], load_vad(), with_timestamps=True)
         segments = job["segments"]
         state["pending"] = len(segments) - job["next_segment"]
-        # Silence should not require loading the large speech model.
         if segments:
-            with st.spinner("Loading local speech model…"):
-                transcribe = get_transcriber()
-            progress = st.progress(
-                job["next_segment"] / len(segments),
-                text=f"Transcribing {len(segments)} speech segment(s)…",
-            )
+            if "transcribe" not in job:
+                job["transcribe"] = create_asr(job["config"]["asr"])
+            progress = st.progress(job["next_segment"] / len(segments), text=f"Transcribing {len(segments)} speech segment(s)…")
             output = st.empty()
             for index in range(job["next_segment"], len(segments)):
                 segment = segments[index]
-                # Compatibility for older in-flight jobs that stored bare arrays.
                 timing = {key: value for key, value in segment.items() if key != "audio"} if isinstance(segment, dict) else {}
                 if "asr_task" not in job:
                     job["asr_task"] = transcribe_in_background(
-                        transcribe, segment["audio"] if isinstance(segment, dict) else segment,
+                        job["transcribe"], segment["audio"] if isinstance(segment, dict) else segment,
+                        on_result=upload_translation_callback(st.session_state.translation, state["texts"]),
                     )
                 task = job["asr_task"]
                 while not task.done():
-                    # Keep completed fast drafts and corrections flowing while
-                    # the next local decode waits for GPU access or inference.
-                    translated = translation_snapshot(state["texts"], state)
+                    translated = translation_snapshot(state["texts"])
                     output.markdown(
-                        render_transcript(
-                            *conversation_args(state["texts"], translated),
-                            **conversation_extras(state, state["texts"], translated),
-                            **reference_view_args(state),
-                        ),
+                        render_transcript(*conversation_args(state["texts"], translated),
+                                          **conversation_extras(state, translated), **reference_view_args(state)),
                         unsafe_allow_html=True,
                     )
                     sleep(0.1)
                 text, timing["asr_start_ms"], timing["asr_final_ms"] = task.result()
                 if text:
                     state["texts"].append(text)
-                    state.setdefault("timings", []).append(timing)
-                # Save progress before UI calls, which may interrupt this run.
+                    state["timings"].append(timing)
                 job["next_segment"] = index + 1
                 job.pop("asr_task")
                 state["pending"] -= 1
-                translated = translation_snapshot(state["texts"], state)
+                translated = translation_snapshot(state["texts"])
                 output.markdown(
-                    render_transcript(
-                        *conversation_args(state["texts"], translated),
-                        **conversation_extras(state, state["texts"], translated), **reference_view_args(state),
-                    ),
+                    render_transcript(*conversation_args(state["texts"], translated),
+                                      **conversation_extras(state, translated), **reference_view_args(state)),
                     unsafe_allow_html=True,
                 )
-                progress.progress(
-                    (index + 1) / len(segments),
-                    text=f"Transcribed {index + 1} of {len(segments)} speech segments",
-                )
-    except Exception as exc:
+                progress.progress((index + 1) / len(segments), text=f"Transcribed {index + 1} of {len(segments)} speech segments")
+    except Exception:
         action = "Run evaluation" if "evaluation" in state else "Transcribe file"
-        state["error"] = f"Could not transcribe this WAV file: {exc}. You can retry {action}."
-    # Streamlit reruns use a BaseException. Let those keep the job/checkpoint;
-    # only success or an ordinary processing error completes this attempt.
+        state["error"] = f"Could not transcribe this WAV file. Check the ASR endpoint and local audio, then retry {action}."
+    # Streamlit reruns use BaseException: retain the task and its owned client.
     state["finished"] = True
     state["pending"] = 0
+    if job.get("transcribe") is not None:
+        job["transcribe"].close()
     st.session_state.pop("upload_job", None)
     st.rerun()
 
 
 def translation_controls():
-    """Configure the next session and pause correction work independently."""
+    """Choose the next conversation's profile for all three input modes."""
     load_dotenv(ENV_FILE, override=False)
     recording = st.session_state.get("recording")
+    context = st.session_state.get("microphone_context")
     busy = st.session_state.get("upload_job") is not None or bool(
         recording and not recording.snapshot()["finished"]
-    )
-
-    def toggle_corrections():
-        lane = st.session_state.get("slow_lane")
-        if lane is not None and "astra" in current_translation_configuration()["providers"]:
-            lane.set_enabled(st.session_state.enable_corrections)
-
-    with st.expander("Translation & speaker settings"):
-        st.toggle("Astra corrections", value=True, key="enable_corrections", on_change=toggle_corrections)
-        try:
-            model, reasoning_effort = correction_settings()
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.caption(f"{model} · {reasoning_effort.capitalize()} reasoning · Reviews fast OpenAI drafts asynchronously.")
-        st.selectbox("Astra view", ["Live subtitles", "Final record"], key="subtitle_view")
-        st.toggle("Nemotron speaker detection", value=True, key="enable_diarization", disabled=busy)
-        st.caption("Speaker detection runs locally. Settings below apply to the next recording or file.")
-        st.caption(
-            "Astra reviews each completed fast translation independently. Reviews run in parallel; "
-            "each accepted correction updates its text and turns the cell subtly green as soon as it finishes. "
-            "Starting a new conversation cancels pending reviews."
+    ) or bool(context and (context.state.playing or context.state.signalling))
+    ready = False
+    try:
+        profiles = load_fast_profiles()
+        default = default_fast_profile(profiles)
+        load_asr_config()
+    except VllmConfigError as exc:
+        st.error(str(exc))
+        st.caption("Configure the ASR endpoint and at least one named fast profile in .env, then restart Streamlit.")
+    else:
+        if st.session_state.get("next_fast_profile") not in profiles:
+            st.session_state.next_fast_profile = default
+        st.selectbox(
+            "Translation model", list(profiles), format_func=lambda alias: profiles[alias].label,
+            key="next_fast_profile", disabled=busy,
+            help="Applies to the next recording, WAV upload, or evaluation. Running work keeps its selected model.",
         )
-        try:
-            output_token_limit = correction_output_token_limit()
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.number_input(
-                "Reasoning + output token cap", min_value=512, max_value=16384,
-                value=output_token_limit, step=512, key="slow_max_tokens", disabled=busy,
-                help="Combined limit for model reasoning and the translation response. "
-                     "Defaults to OPENAI_CORRECTION_MAX_OUTPUT_TOKENS (16384 when unset). "
-                     "A smaller cap can prevent high-reasoning reviews from finishing.",
-            )
-        st.slider("Minimum correction confidence", min_value=0.0, max_value=1.0, value=0.6, step=0.05,
-                  key="slow_confidence", disabled=busy)
-        st.text_input("Glossary file path", value=os.getenv("GLOSSARY_FILE", ""), key="glossary_path")
-        st.text_input("Do-not-translate file path", value=os.getenv("DNT_FILE", ""), key="dnt_path")
-        st.caption("Optional CSV, TSV, JSON or XLSX glossary. A DNT list may also be TXT. Evaluation references are never glossary inputs.")
-        if st.button("Reload terminology", key="reload_glossary"):
-            try:
-                updated = load_glossary(st.session_state.glossary_path or None, st.session_state.dnt_path or None)
-                if "glossary" in st.session_state:
-                    st.session_state.glossary.replace_master(updated)
-                else:
-                    st.session_state.glossary = updated
-                st.success("Terminology reloaded for current and future segments.")
-            except (ValueError, OSError) as exc:
-                st.error(f"Could not reload terminology: {exc}")
-        if "glossary" in st.session_state:
-            st.caption(f"{len(st.session_state.glossary.entries)} master terminology entries loaded.")
-        elif not st.session_state.glossary_path and not st.session_state.dnt_path:
-            st.caption("No master glossary configured. Tool-like identifiers are still protected.")
+        ready = True
+    with st.expander("Terminology settings"):
+        st.text_input("Glossary file path", value=os.getenv("GLOSSARY_FILE", ""), key="glossary_path", disabled=busy)
+        st.text_input("Do-not-translate file path", value=os.getenv("DNT_FILE", ""), key="dnt_path", disabled=busy)
+        st.caption("Optional local terminology files, frozen when a conversation starts. Evaluation references are never model inputs.")
+    if st.button("Clear conversation", key="clear_conversation", disabled=not st.session_state.get("conversation_config")):
+        close_conversation()
+        st.rerun()
+    return ready
 
 
 with st.container(key="workspace"):
@@ -1001,33 +768,28 @@ with st.container(key="workspace"):
 with input_column, st.container(key="input_card"):
     st.markdown(
         '<div class="panel-heading"><div><div class="eyebrow">Speaking language</div>'
-        '<div class="language-name">Mandarin / Chinglish</div></div>'
-        '<span class="language-tag">中文 + EN</span></div>',
+        '<div class="language-name">Taiwanese Hokkien / Mandarin / English</div></div></div>',
         unsafe_allow_html=True,
     )
-    translation_controls()
+    configuration_ready = translation_controls()
     microphone_tab, upload_tab, evaluation_tab = st.tabs(["Microphone", "Upload WAV", "Evaluate"])
     with microphone_tab:
         st.markdown(
-            '<div class="mic-stage"><div class="mic-symbol" aria-hidden="true">'
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" '
-            'stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/>'
-            '<path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg></div>'
-            '<h3>Your voice, in English.</h3>'
-            '<p>Speak naturally. Compare fast translations<br>with contextual Astra corrections.</p></div>',
+            '<div class="mic-stage"><h3>Your voice, in English.</h3>'
+            '<p>Speech detection stays local. Your selected vLLM endpoints transcribe and translate.</p></div>',
             unsafe_allow_html=True,
         )
-        session, context = recording_panel()
+        session, context = recording_panel(configuration_ready)
     with upload_tab:
-        upload_panel(session, context)
+        upload_panel(session, context, configuration_ready)
     with evaluation_tab:
-        upload_panel(session, context, evaluate=True)
+        upload_panel(session, context, configuration_ready, evaluate=True)
     st.markdown(
-        '<div class="privacy-note">Audio and Tencent translation stay on this Mac. '
-        'Transcript text and configured glossary context go to OpenAI for fast translation and Astra corrections.</div>',
+        '<div class="privacy-note">Speech segments are sent to the configured vLLM ASR endpoint. '
+        'Transcript text and terminology context go to the selected vLLM translation endpoint. '
+        'Evaluation references stay on the app server.</div>',
         unsafe_allow_html=True,
     )
-
 with transcript_column, st.container(key="transcript_card"):
     if st.session_state.get("upload_job") is not None:
         process_upload()
@@ -1038,10 +800,7 @@ with transcript_column, st.container(key="transcript_card"):
     else:
         state = session.snapshot()
         show_transcript(session, context, (state["accepting"], state["finished"]))
-
 st.markdown(
-    '<p class="workspace-note">One line per speech segment. '
-    'Astra reviews source text and fast drafts. '
-    'Speaker labels update independently; reference lines follow the uploaded file.</p>',
-    unsafe_allow_html=True,
+    '<p class="workspace-note">One line per speech segment. English translations appear as they finish; '
+    'reference lines follow the uploaded file.</p>', unsafe_allow_html=True,
 )

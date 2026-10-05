@@ -1,0 +1,11 @@
+# Optional historical Breeze asset notebook; not needed by the vLLM app.
+-r requirements.txt
+transformers>=5.18.0
+accelerate
+huggingface_hub
+librosa>=0.11
+jupyterlab
+ipywidgets
+datasets
+pandas
+tqdm

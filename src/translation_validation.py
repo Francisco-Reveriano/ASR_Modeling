@@ -1,4 +1,4 @@
-"""Reject untranslated East Asian scripts in English translation output."""
+"""Shared guards for public English translations."""
 
 import re
 
@@ -14,6 +14,10 @@ _CJK = re.compile(
     "\u3105-\u312f\u31a0-\u31bf"
     "\u1100-\u11ff\u3131-\u318e\ua960-\ua97f\uac00-\ud7ff\uffa0-\uffdc]"
 )
+_REASONING_MARKUP = re.compile(
+    r"</?(?:think|analysis|reasoning)(?:\s[^>]*)?>|<\|(?:analysis|begin_of_thought|end_of_thought)\|>",
+    re.IGNORECASE,
+)
 
 
 def contains_cjk(text: str) -> bool:
@@ -23,3 +27,13 @@ def contains_cjk(text: str) -> bool:
     transliterations and accented English names are intentionally accepted.
     """
     return _CJK.search(text) is not None
+
+
+def contains_reasoning_markup(text: str) -> bool:
+    """Identify explicit reasoning delimiters, never ordinary English prose.
+
+    Reject the whole target rather than stripping blocks or risking partial
+    answers. This intentionally leaves names, accents, symbols, and ordinary
+    words such as "think" or "analysis" alone.
+    """
+    return _REASONING_MARKUP.search(text) is not None

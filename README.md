@@ -10,6 +10,57 @@ The previous OpenAI, Tencent, speaker detection, and two-pass correction tool is
 preserved on the `OpenAI-Translation-Updates` branch. Those workers and large
 local models are absent from this branch's runtime.
 
+## End-to-end structure
+
+The production path on this branch has four stages: input, segmentation, ASR,
+and translation. Solid arrows show what runs today. Dotted arrows show speaker
+diarization, which is deferred and not installed or run on this branch.
+
+```mermaid
+flowchart TD
+    subgraph input["1. Input"]
+        mic["Browser microphone"]
+        file["Audio source file (WAV)"]
+        resample["Local mono 16 kHz resampling"]
+    end
+    mic --> resample
+    file --> resample
+
+    subgraph segmentation["2. VAD or diarization"]
+        vad["Local Silero VAD<br/>bounded speech segments"]
+        diarization["nvidia/Nemotron-3-Diarization<br/>deferred: not run on this branch"]
+    end
+    resample -->|"speech frames"| vad
+    resample -.->|"continuous audio"| diarization
+
+    asr["3. ASR<br/>hosted vLLM<br/>POST /v1/audio/transcriptions"]
+    vad -->|"one WAV segment per request"| asr
+
+    translation["4. Translation<br/>ordered worker, hosted vLLM<br/>POST /v1/chat/completions<br/>English and identifier validation"]
+    asr -->|"original-language transcript"| translation
+
+    rows["Source and English transcript rows"]
+    translation -->|"validated English"| rows
+    diarization -.->|"anonymous Speaker N labels"| rows
+```
+
+Resampling and Silero VAD run in the app process. ASR and translation run on
+the configured vLLM instances, which may be separate servers with separate keys.
+
+### Speaker diarization model
+
+The previous local speaker detection used
+[`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization)
+at pinned revision `f667ed73aee57d40cc39428eb768b4fd87a0a29e`, added in commit
+[`42f2c71`](https://github.com/Francisco-Reveriano/ASR_Modeling/commit/42f2c714606d123ed902c0157a4d110be5e756ca).
+It ran locally on CPU, streamed continuous audio (including silence)
+independently from ASR, and produced anonymous labels such as `Speaker 1` that
+were matched to transcript rows by audio-time overlap.
+
+The current `vLLM-Hosting` runtime does not install, configure, or execute this
+model, and transcript rows have no speaker labels. Speaker diarization remains
+deferred.
+
 ## Linux setup
 
 Create a Python environment on the Linux machine. Python 3.11 or newer is

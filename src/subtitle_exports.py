@@ -4,6 +4,8 @@ import csv
 from io import StringIO
 import math
 
+from src.translation_validation import contains_cjk
+
 
 def _sealed_rows(snapshot, speakers):
     final = snapshot.get("authoritative", [])
@@ -11,6 +13,8 @@ def _sealed_rows(snapshot, speakers):
         text = final[index] if index < len(final) else None
         if text is None:
             continue
+        if record.get("source_fallback") or not text.strip() or contains_cjk(text):
+            text = "[Translation unavailable]"
         timing = record.get("timing") or {}
         speaker = speakers[index] if speakers and index < len(speakers) else timing.get("speaker_id", "")
         yield record, text, timing.get("start_s"), timing.get("end_s"), speaker or ""
@@ -30,6 +34,8 @@ def export_captions(snapshot, *, format="srt", speakers=None):
         raise ValueError("Caption format must be srt or vtt.")
     rows = []
     for record, text, start, end, speaker in _sealed_rows(snapshot, speakers):
+        if record.get("seal_reason") == "filtered":
+            continue
         if any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in (start, end)):
             continue
         if start < 0 or end <= start:
@@ -38,8 +44,6 @@ def export_captions(snapshot, *, format="srt", speakers=None):
         # Keep generated output from injecting a second caption cue. Visible
         # angle brackets remain ordinary words when read in subtitle players.
         clean = " ".join(text.split()).replace("-->", "→").replace("<", "‹").replace(">", "›")
-        if record.get("source_fallback"):
-            clean = "[Source fallback] " + clean
         if speaker:
             clean = f"{speaker}: {clean}"
         rows.append(f"{len(rows) + 1}\n{_timestamp(start, decimal)} --> {_timestamp(end, decimal)}\n{clean}")
@@ -52,10 +56,13 @@ def export_bilingual_csv(snapshot, *, speakers=None):
     """Include only sealed rows, plus source, IDs, speaker, and review status."""
     output = StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["segment_id", "start_s", "end_s", "speaker", "source_text", "final_text", "seal_reason", "source_fallback"])
+    writer.writerow(["segment_id", "start_s", "end_s", "speaker", "source_text", "final_text", "seal_reason", "source_fallback",
+                     "first_review_status", "conversation_review_status"])
     for record, text, start, end, speaker in _sealed_rows(snapshot, speakers):
         values = [record["segment_id"], start, end, speaker, record["source_text"], text,
-                  record.get("seal_reason", ""), record.get("source_fallback", False)]
+                  record.get("seal_reason", ""), record.get("source_fallback", False),
+                  record.get("first_pass_status", record.get("status", "")),
+                  record.get("conversation_review_status", "")]
         writer.writerow(["'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")) else value
                          for value in values])
     return output.getvalue()

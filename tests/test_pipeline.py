@@ -1,10 +1,12 @@
 """Exercise recording behavior without loading the speech models."""
 
 from fractions import Fraction
+import gc
 from queue import Empty, Queue
 from threading import Event
 import unittest
 from unittest.mock import Mock, patch
+import weakref
 
 import av
 import numpy as np
@@ -54,6 +56,8 @@ class LiveTranscriberTests(unittest.TestCase):
             pipeline._worker.join(timeout=5)
         self.assertFalse(pipeline._worker.is_alive(), "worker did not finish")
         self.assertTrue(pipeline.snapshot()["finished"])
+        self.assertEqual(pipeline._buffer.size, 0)
+        self.assertEqual(pipeline._tail.size, 0)
 
     def test_stop_without_audio_finishes_without_a_worker(self):
         pipeline = self.make_pipeline(ScriptedVAD())
@@ -173,7 +177,37 @@ class LiveTranscriberTests(unittest.TestCase):
         self.assertEqual((timing["start_s"], timing["end_s"]), (512 / SAMPLE_RATE, 1800 / SAMPLE_RATE))
         self.assertGreaterEqual(timing["asr_final_ms"], timing["asr_start_ms"])
         self.assertIsNone(timing["t_capture_ms"])
-        np.testing.assert_array_equal(pipeline._retained_audio[0], samples[512:1800])
+        np.testing.assert_array_equal(self.segments[0], samples[512:1800])
+
+    def test_completed_speech_is_released_while_capture_continues(self):
+        started, release, collected = Event(), Event(), Event()
+        references = []
+
+        def transcribe(samples):
+            references.append(weakref.ref(samples, lambda _: collected.set()))
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            return self.record(samples)
+
+        pipeline = self.make_pipeline(
+            ScriptedVAD({1: {"start": 0}, 2: {"end": 700}}),
+            transcribe=transcribe,
+        )
+        self.addCleanup(release.set)
+        samples = np.arange(1024, dtype=np.float32) / 1024
+        pipeline.push(audio_frame(samples))
+        self.assertTrue(started.wait(timeout=5))
+        self.assertIsNotNone(references[0]())
+        self.assertEqual(pipeline.snapshot()["pending"], 1)
+
+        release.set()
+        self.assertTrue(collected.wait(timeout=5), "completed speech is still retained")
+        snapshot = pipeline.snapshot()
+        self.assertTrue(snapshot["accepting"])
+        self.assertEqual(snapshot["texts"], ["segment 1"])
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["timings"][0]["end_s"], 700 / SAMPLE_RATE)
+        np.testing.assert_array_equal(self.segments[0], samples[:700])
 
     def test_stop_drains_audio_enqueued_immediately_after_worker_timeout(self):
         timed_out, release = Event(), Event()
@@ -271,7 +305,10 @@ class LiveTranscriberTests(unittest.TestCase):
         np.testing.assert_array_equal(self.segments[1], samples[1024:1600])
 
     def test_inference_failure_is_visible_and_worker_stops(self):
+        references = []
+
         def transcribe(samples):
+            references.append(weakref.ref(samples))
             raise RuntimeError("decode broke")
 
         pipeline = self.make_pipeline(
@@ -287,6 +324,8 @@ class LiveTranscriberTests(unittest.TestCase):
         self.assertFalse(snapshot["accepting"])
         self.assertEqual(snapshot["texts"], [])
         self.assertEqual(snapshot["pending"], 0)
+        gc.collect()
+        self.assertIsNone(references[0](), "failed speech is still retained")
 
     def test_vad_failure_is_visible_and_worker_stops(self):
         def vad(chunk):

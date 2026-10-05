@@ -193,10 +193,6 @@ class LiveTranscriber:
         self._finished = Event()
         self._texts = []
         self._timings = []
-        # Keep accepted speech buffers for this session's lifetime. They never
-        # enter UI snapshots or cloud requests; replacing the session releases
-        # them. This is in-memory retention, not durable audio archival.
-        self._retained_audio = []
         self._diarization = diarization
         # Count both queued and in-progress segments for the UI's status.
         self._pending = 0
@@ -314,7 +310,6 @@ class LiveTranscriber:
                     "t_capture_ms": None,
                 }
                 self._queue.put_nowait((audio, timing))
-                self._retained_audio.append(audio)
                 self._pending += 1
             except Full:
                 self._fail(
@@ -331,6 +326,17 @@ class LiveTranscriber:
         """
         self._error = message
         self._input_ended.set()
+
+    def _release_capture_audio(self):
+        """Release residual audio after capture and queued ASR have ended.
+
+        The caller holds _lock. Text and timings outlive these buffers; speaker
+        detection owns its own audio copies and may still be finishing.
+        """
+        self._buffer = np.empty(0, dtype=np.float32)
+        self._tail = np.empty(0, dtype=np.float32)
+        self._offset = self._position
+        self._speech_start = None
 
     def finish(self):
         """Close input and submit remaining speech without waiting for ASR.
@@ -365,6 +371,7 @@ class LiveTranscriber:
                 if self._diarization is not None:
                     self._diarization.finish()
                 if self._worker.ident is None:
+                    self._release_capture_audio()
                     self._finished.set()
 
     def _run(self):
@@ -405,7 +412,13 @@ class LiveTranscriber:
                             self._queue.get_nowait()
                         self._pending = 0
                     return
+                finally:
+                    # Do not keep the last segment alive while waiting for
+                    # more speech. The queue owns any remaining segments.
+                    del audio
         finally:
+            with self._lock:
+                self._release_capture_audio()
             if self._diarization is not None:
                 self._diarization.finish()
             self._finished.set()

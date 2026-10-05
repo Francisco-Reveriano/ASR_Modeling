@@ -1,22 +1,33 @@
-transformers>=5.18.0
-jupyterlab
-numpy
-pandas
-openpyxl==3.1.5
-defusedxml==0.7.1
-ipywidgets
-tqdm
+# Local speech recognition and translation models
 torch
+transformers>=5.18.0
 accelerate
+silero-vad
+huggingface_hub
+
+# Audio processing
+numpy
 soundfile
 librosa>=0.11
 scipy
-datasets
-python-dotenv
-openai==3.24.0
-jiwer==4.0.0
-huggingface_hub
-silero-vad
+av>=15.1.0
+
+# Streamlit app and browser microphone capture
 streamlit==1.65.0
 streamlit-webrtc==0.64.5
-av>=15.1.0
+
+# API translation and configuration
+python-dotenv
+openai==3.24.0
+
+# Reference parsing and transcription evaluation
+jiwer==4.0.0
+openpyxl==3.1.5
+defusedxml==0.7.1
+
+# Asset download notebook and data exploration
+jupyterlab
+ipywidgets
+datasets
+pandas
+tqdm

@@ -13,18 +13,28 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 from src.evaluation import mixed_match_score, parse_reference, word_match_score
 from src.glossary import load_glossary
 from src.pipeline import LiveTranscriber, load_transcriber, load_vad
-from src.reasoning import DEFAULT_REASONING_MODEL, PROMPT_VERSION, correct_translations
+from src.reasoning import (
+    PROMPT_VERSION, correct_translations, correction_output_token_limit, correction_settings,
+)
 from src.reference_tables import (
     parsed_table_reference, read_reference_tables, recommend_columns,
     suggest_header_row, suggest_table, table_columns,
 )
 from src.tencent import TENCENT_ERROR_MESSAGE, translate_with_tencent
-from src.translation import ENV_FILE, TranslationSession
+from src.translation import ENV_FILE, TranslationSession, background_filter_enabled
 from src.slow_lane import SlowLaneConfig, SlowLaneSession
+from src.conversation_review import ConversationReviewSession
 from src.diarization import DiarizationSession, speaker_labels
 from src.subtitle_exports import export_bilingual_csv, export_captions
 from src.ui import export_conversation, render_transcript
 from src.uploads import decode_wav, speech_segments, transcribe_in_background
+
+TRANSLATION_TYPES = {
+    "Compare all translations": (("openai", "tencent", "astra"), True),
+    "Fast English": (("openai",), False),
+    "Corrected English": (("openai", "astra"), False),
+    "Fully reviewed English": (("openai", "astra"), True),
+}
 
 st.set_page_config(page_title="Breeze Voice", page_icon="🎙️", layout="wide")
 st.html(Path(__file__).parent / "assets" / "style.css")
@@ -51,13 +61,11 @@ def get_transcriber():
 
 def slow_config():
     """Freeze the controls into the new session's reproducible configuration."""
+    model, reasoning_effort = correction_settings()
     return SlowLaneConfig(
-        model=DEFAULT_REASONING_MODEL, reasoning_effort="medium",
-        window_n=st.session_state.get("slow_window_n", 4),
-        revision_horizon_s=st.session_state.get("slow_horizon", 20),
-        seal_timeout_s=st.session_state.get("slow_seal_timeout", 30),
-        request_timeout_s=st.session_state.get("slow_request_timeout", 20),
-        max_output_tokens=st.session_state.get("slow_max_tokens", 4096),
+        model=model, reasoning_effort=reasoning_effort,
+        filter_background_speech=background_filter_enabled(),
+        max_output_tokens=st.session_state.get("slow_max_tokens", correction_output_token_limit()),
         confidence_threshold=st.session_state.get("slow_confidence", 0.6),
         source_lang="zh-TW+en", target_lang="en",
         enabled=st.session_state.get("enable_corrections", True),
@@ -73,7 +81,41 @@ def terminology():
     return st.session_state.glossary
 
 
-def reset_translation(*, diarization_max_pending_seconds=600):
+def translation_configuration(name="Compare all translations"):
+    """Return the provider choices frozen when a conversation starts."""
+    providers, second_review = TRANSLATION_TYPES[name]
+    return {"type": name, "providers": providers, "second_review": second_review}
+
+
+def current_translation_configuration():
+    return st.session_state.get("translation_config", translation_configuration())
+
+
+def new_review_session(config, glossary, selected):
+    session_type = ConversationReviewSession if selected["second_review"] else SlowLaneSession
+    return session_type(correct_translations, config=config, glossary=glossary)
+
+
+def ensure_review_session(texts):
+    selected = current_translation_configuration()
+    if "astra" not in selected["providers"]:
+        return None
+    if texts and "slow_lane" not in st.session_state:
+        st.session_state.slow_lane = new_review_session(slow_config(), terminology(), selected)
+    return st.session_state.get("slow_lane")
+
+
+def correction_callback(lane):
+    """Bind fast results to their own conversation without worker UI access."""
+    def on_result(texts, result):
+        lane.submit(
+            texts, result["translations"], draft_errors=result.get("errors", []),
+            draft_filtered=result.get("filtered", []), allow_prefix=True,
+        )
+    return on_result
+
+
+def reset_translation(*, translation_type="Compare all translations", diarization_max_pending_seconds=600):
     """End old work and allocate independent fast, slow, and speaker workers."""
     # Load configured files before closing a usable previous session. File I/O
     # never runs on the audio, translator, or correction worker's critical path.
@@ -81,30 +123,32 @@ def reset_translation(*, diarization_max_pending_seconds=600):
         st.session_state.get("glossary_path") or None,
         st.session_state.get("dnt_path") or None,
     )
-    config = slow_config()
+    selected = translation_configuration(translation_type)
+    config = slow_config() if "astra" in selected["providers"] else None
     for key in ("translation", "tencent_translation", "slow_lane", "diarization"):
-        previous = st.session_state.get(key)
+        previous = st.session_state.pop(key, None)
         if previous is not None:
             previous.close()
     st.session_state.glossary = glossary
-    st.session_state.translation = TranslationSession(glossary=glossary)
-    st.session_state.tencent_translation = TranslationSession(
-        translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
+    st.session_state.translation_config = selected
+    lane = new_review_session(config, glossary, selected) if config is not None else None
+    if lane is not None:
+        st.session_state.slow_lane = lane
+    st.session_state.translation = TranslationSession(
+        glossary=glossary, on_result=correction_callback(lane) if lane is not None else None,
     )
-    st.session_state.slow_lane = SlowLaneSession(correct_translations, config=config, glossary=glossary)
+    if "tencent" in selected["providers"]:
+        st.session_state.tencent_translation = TranslationSession(
+            translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
+        )
     st.session_state.diarization = DiarizationSession(
         enabled=st.session_state.get("enable_diarization", True),
         max_pending_seconds=diarization_max_pending_seconds,
     )
 
 
-def conversation_extras(state, texts, translated):
-    """Publish fast drafts before consulting either asynchronous worker."""
-    if texts and "slow_lane" not in st.session_state:
-        st.session_state.slow_lane = SlowLaneSession(
-            correct_translations, config=slow_config(), glossary=terminology(),
-        )
-    lane = st.session_state.get("slow_lane")
+def conversation_metadata(state, texts):
+    """Copy available audio offsets and speaker labels on the Streamlit thread."""
     original_timings = state.get("timings", []) if state else []
     timings = [dict(original_timings[index]) if index < len(original_timings) and original_timings[index] else {}
                for index in range(len(texts))]
@@ -120,35 +164,54 @@ def conversation_extras(state, texts, translated):
         for timing, speaker in zip(timings, speakers):
             if speaker is not None:
                 timing["speaker_id"] = speaker
+    return timings, speakers
+
+
+def conversation_extras(state, texts, translated):
+    """Refresh metadata and retain polling recovery for fast-result observers."""
+    lane = ensure_review_session(texts)
+    timings, speakers = conversation_metadata(state, texts)
     if lane is not None:
         lane.submit(
             texts, translated["openai"]["translations"],
             draft_errors=translated["openai"]["errors"], timings=timings,
+            draft_filtered=translated["openai"].get("filtered", []),
         )
         slow = lane.snapshot()
     else:
         slow = {"translations": [], "statuses": [], "authoritative": [],
                 "segments": [], "pending": 0, "status": "idle", "metrics": {}}
     slow["view"] = "authoritative" if st.session_state.get("subtitle_view") == "Final record" else "speculative"
-    return {"slow_lane": slow, "speakers": speakers}
+    return {"slow_lane": slow, "speakers": speakers,
+            "providers": current_translation_configuration()["providers"]}
 
 
-def translation_snapshot(texts):
+def translation_snapshot(texts, state=None):
     """Send the same original text to independent cloud and local workers.
 
     Neither translator consumes the other's output or waits for it. Each queue
     deduplicates segment positions across UI polls. Creating a missing provider
     independently also preserves existing results after an app update.
     """
+    providers = current_translation_configuration()["providers"]
+    lane = ensure_review_session(texts)
     if texts and "translation" not in st.session_state:
-        st.session_state.translation = TranslationSession()
-    if texts and "tencent_translation" not in st.session_state:
+        st.session_state.translation = TranslationSession(
+            glossary=terminology(), on_result=correction_callback(lane) if lane is not None else None,
+        )
+    if texts and "tencent" in providers and "tencent_translation" not in st.session_state:
         st.session_state.tencent_translation = TranslationSession(
             translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
         )
+    if texts and lane is not None:
+        # A fast result can arrive before the next UI refresh. Seed source and
+        # available metadata before starting its provider, then let the captured
+        # lane callback publish completed drafts without waiting for a poll.
+        timings, _ = conversation_metadata(state, texts)
+        lane.submit(texts, [], timings=timings)
     results = {}
     for provider, key in (("openai", "translation"), ("tencent", "tencent_translation")):
-        translation = st.session_state.get(key)
+        translation = st.session_state.get(key) if provider in providers else None
         if translation is None:
             results[provider] = {"translations": [], "errors": [], "pending": 0}
         else:
@@ -314,10 +377,62 @@ def evaluation_report(state, results):
     return "\n".join(lines)
 
 
+def correction_status(slow):
+    """Show review progress and recovery only for a selected correction lane."""
+    slow_status = slow["status"]
+    active_reviews = slow.get("active_reviews", slow.get("pending", 0))
+    queued_reviews = max(0, slow.get("pending", 0) - active_reviews)
+    review_progress = f"{active_reviews} segment(s) under review"
+    if queued_reviews:
+        review_progress += f" · {queued_reviews} awaiting review"
+    status_caption = {
+        "active": f"Astra · {review_progress}",
+        "paused": "Astra · Corrections paused · Fast translations continue",
+        "degraded": "Astra · Some reviews need retry · Fast translations continue",
+        "closed": "Astra · Session ended",
+        "idle": "Astra · Ready",
+    }.get(slow_status, "Astra")
+    if slow_status == "degraded" and slow.get("pending"):
+        status_caption += f" · {review_progress}"
+    if slow.get("config"):
+        config = slow["config"]
+        status_caption += f" · {config['model']} · {config['reasoning_effort'].capitalize()} reasoning"
+    st.caption(status_caption)
+    conversation_review = slow.get("conversation_review", {})
+    if conversation_review.get("enabled"):
+        reviewed, total = conversation_review.get("reviewed", 0), conversation_review.get("total", 0)
+        progress = f"Conversation review {reviewed}/{total}"
+        if conversation_review.get("status") == "degraded":
+            progress += " · Needs retry"
+        elif conversation_review.get("status") == "paused":
+            progress += " · Paused"
+        elif conversation_review.get("active_reviews"):
+            progress += " · Reviewing"
+        elif conversation_review.get("pending"):
+            progress += " · Waiting for earlier reviews"
+        elif total and reviewed == total:
+            progress += " · Complete"
+        st.caption(progress)
+    if slow_status == "degraded" and st.button("Retry open corrections", key="retry_corrections"):
+        st.session_state.slow_lane.retry_failed()
+        st.rerun()
+    review_errors = list(dict.fromkeys(
+        segment["error"] for segment in slow.get("segments", []) if segment.get("error")
+    ))
+    if review_errors:
+        st.warning("Astra: " + " ".join(review_errors))
+    conversation_errors = list(dict.fromkeys(
+        segment["conversation_review_error"] for segment in slow.get("segments", [])
+        if segment.get("conversation_review_error")
+    ))
+    if conversation_errors:
+        st.warning("Conversation review: " + " ".join(conversation_errors))
+
+
 def transcript_panel(state=None, context=None):
     """Draw the current snapshot without changing the recording session."""
     texts = state["texts"] if state else []
-    translated = translation_snapshot(texts)
+    translated = translation_snapshot(texts, state)
     extras = conversation_extras(state, texts, translated)
     translation_pending = any(result["pending"] for result in translated.values())
     translation_failed = any(any(result["errors"]) for result in translated.values())
@@ -373,6 +488,8 @@ def transcript_panel(state=None, context=None):
         ("openai", "OpenAI", "translation", "retry_translation"),
         ("tencent", "Tencent · Local", "tencent_translation", "retry_tencent_translation"),
     ):
+        if provider not in extras["providers"]:
+            continue
         result = translated[provider]
         if result["pending"]:
             st.caption(f"{label} · Translating {result['pending']} segment(s) into English")
@@ -387,16 +504,8 @@ def transcript_panel(state=None, context=None):
         evaluation_panel(state, results)
     slow = extras["slow_lane"]
     slow_status = slow["status"]
-    st.caption({
-        "active": "Astra · Reviewing recent segments · Medium reasoning",
-        "paused": "Astra · Corrections paused · Fast translations continue",
-        "degraded": "Astra · Corrections unavailable · Fast translations continue",
-        "closed": "Astra · Session ended",
-        "idle": "Astra · Ready · Medium reasoning",
-    }.get(slow_status, "Astra · Medium reasoning"))
-    if slow_status == "degraded" and st.button("Retry open corrections", key="retry_corrections"):
-        st.session_state.slow_lane.retry_failed()
-        st.rerun()
+    if "astra" in extras["providers"]:
+        correction_status(slow)
     diarization = st.session_state.get("diarization")
     if diarization is not None:
         speaker_state = diarization.snapshot()
@@ -413,13 +522,14 @@ def transcript_panel(state=None, context=None):
     if slow.get("segments"):
         with st.expander("Correction history & session export"):
             st.caption(
-                "Live subtitles keep their current text after the revision window. "
-                "Final record shows sealed results, including accepted corrections that arrived later. "
-                "A sealed result never changes."
+                "Accepted corrections replace the Astra draft and show Corrected when review finishes. "
+                "Unchanged reviews show Confirmed. The first review is retained in the audit; "
+                "the latest accepted review appears in the transcript and exports."
             )
             st.json({"status": slow_status, "metrics": slow.get("metrics", {}),
                      "config": slow.get("config", {}), "learned_terms": slow.get("learned_terms", [])})
-            record = dict(slow, prompt_version=PROMPT_VERSION)
+            record = dict(slow, prompt_version=PROMPT_VERSION,
+                          translation_config=current_translation_configuration())
             if diarization is not None:
                 record["diarization"] = speaker_state
             st.download_button(
@@ -493,7 +603,9 @@ def recording_panel():
             with st.spinner("Loading local speech models…"):
                 transcribe = get_transcriber()
                 vad = load_vad()
-            reset_translation()
+            reset_translation(translation_type=st.session_state.get(
+                "microphone_translation_type", "Compare all translations",
+            ))
             session = LiveTranscriber(transcribe, vad, diarization=st.session_state.diarization)
         except Exception as exc:
             st.session_state.model_error = f"Could not load the local speech models: {exc}"
@@ -519,6 +631,12 @@ def recording_panel():
     # Keep the component mounted outside the polling fragment. Its device picker
     # remains accessible without duplicating recording controls in the main view.
     with st.expander("Microphone settings", icon=":material/tune:"):
+        st.selectbox(
+            "Translation type", list(TRANSLATION_TYPES), key="microphone_translation_type",
+            disabled=busy or bool(session and not session.snapshot()["finished"]),
+            help="Applies to the next recording. Fast uses OpenAI; Corrected adds Astra; "
+                 "Fully reviewed adds a conversation review. Compare all also runs Tencent locally.",
+        )
         if session is None:
             st.caption("Microphone devices will be available after you start recording.")
         else:
@@ -708,7 +826,7 @@ def upload_panel(session, context, *, evaluate=False):
             st.session_state.upload_state = {
                 "texts": [], "pending": 0, "accepting": False,
                 "finished": False, "error": None, "name": uploaded.name,
-                "timings": [], "retained_audio": audio,
+                "timings": [],
             }
             st.session_state.diarization.push(audio)
             st.session_state.diarization.finish()
@@ -737,7 +855,8 @@ def process_upload():
     The job was stored on the previous run so input controls are already
     disabled. A checkpoint after each segment lets an interrupted Streamlit
     run resume without dropping or repeating completed text. Completed jobs
-    are removed, so ordinary reruns and downloads never repeat inference.
+    are removed along with their audio and segment views; results retain only
+    text and metadata, and ordinary reruns and downloads never repeat inference.
     No file or transcript is written to disk.
     """
     job = st.session_state.upload_job
@@ -774,7 +893,7 @@ def process_upload():
                 while not task.done():
                     # Keep completed fast drafts and corrections flowing while
                     # the next local decode waits for GPU access or inference.
-                    translated = translation_snapshot(state["texts"])
+                    translated = translation_snapshot(state["texts"], state)
                     output.markdown(
                         render_transcript(
                             *conversation_args(state["texts"], translated),
@@ -792,7 +911,7 @@ def process_upload():
                 job["next_segment"] = index + 1
                 job.pop("asr_task")
                 state["pending"] -= 1
-                translated = translation_snapshot(state["texts"])
+                translated = translation_snapshot(state["texts"], state)
                 output.markdown(
                     render_transcript(
                         *conversation_args(state["texts"], translated),
@@ -825,25 +944,37 @@ def translation_controls():
 
     def toggle_corrections():
         lane = st.session_state.get("slow_lane")
-        if lane is not None:
+        if lane is not None and "astra" in current_translation_configuration()["providers"]:
             lane.set_enabled(st.session_state.enable_corrections)
 
     with st.expander("Translation & speaker settings"):
         st.toggle("Astra corrections", value=True, key="enable_corrections", on_change=toggle_corrections)
-        st.caption("GPT-6 Astra · Medium reasoning · Reviews fast OpenAI drafts asynchronously.")
+        try:
+            model, reasoning_effort = correction_settings()
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.caption(f"{model} · {reasoning_effort.capitalize()} reasoning · Reviews fast OpenAI drafts asynchronously.")
         st.selectbox("Astra view", ["Live subtitles", "Final record"], key="subtitle_view")
         st.toggle("Nemotron speaker detection", value=True, key="enable_diarization", disabled=busy)
         st.caption("Speaker detection runs locally. Settings below apply to the next recording or file.")
-        st.number_input("Context segments", min_value=1, max_value=8, value=4,
-                        key="slow_window_n", disabled=busy)
-        st.number_input("Revision window (seconds)", min_value=0, max_value=120, value=20,
-                        key="slow_horizon", disabled=busy)
-        st.number_input("Seal timeout (seconds)", min_value=5, max_value=120, value=30,
-                        key="slow_seal_timeout", disabled=busy)
-        st.number_input("Reasoning timeout (seconds)", min_value=1, max_value=60, value=20,
-                        key="slow_request_timeout", disabled=busy)
-        st.number_input("Reasoning output cap", min_value=512, max_value=16384, value=4096, step=512,
-                        key="slow_max_tokens", disabled=busy)
+        st.caption(
+            "Astra reviews each completed fast translation independently. Reviews run in parallel; "
+            "each accepted correction updates its text and turns the cell subtly green as soon as it finishes. "
+            "Starting a new conversation cancels pending reviews."
+        )
+        try:
+            output_token_limit = correction_output_token_limit()
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.number_input(
+                "Reasoning + output token cap", min_value=512, max_value=16384,
+                value=output_token_limit, step=512, key="slow_max_tokens", disabled=busy,
+                help="Combined limit for model reasoning and the translation response. "
+                     "Defaults to OPENAI_CORRECTION_MAX_OUTPUT_TOKENS (16384 when unset). "
+                     "A smaller cap can prevent high-reasoning reviews from finishing.",
+            )
         st.slider("Minimum correction confidence", min_value=0.0, max_value=1.0, value=0.6, step=0.05,
                   key="slow_confidence", disabled=busy)
         st.text_input("Glossary file path", value=os.getenv("GLOSSARY_FILE", ""), key="glossary_path")
@@ -910,7 +1041,7 @@ with transcript_column, st.container(key="transcript_card"):
 
 st.markdown(
     '<p class="workspace-note">One line per speech segment. '
-    'Astra reviews recent source text and fast drafts. '
+    'Astra reviews source text and fast drafts. '
     'Speaker labels update independently; reference lines follow the uploaded file.</p>',
     unsafe_allow_html=True,
 )

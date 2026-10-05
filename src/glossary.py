@@ -11,6 +11,8 @@ from threading import Lock
 from types import MappingProxyType
 import unicodedata
 
+from src.translation_validation import contains_cjk
+
 
 MAX_RETRIEVED = 40
 MAX_LEARNED = 200
@@ -79,18 +81,23 @@ def _entry(value):
     elif flag not in (True, False, 0, 1, None):
         raise ValueError("Glossary dnt must be true or false.")
     result["dnt"] = bool(flag)
-    if result["dnt"]:
-        if result["term_tgt"] and result["term_tgt"] != source:
-            raise ValueError("DNT entries must preserve term_src exactly in term_tgt.")
-        result["term_tgt"] = source
-    elif not result["term_tgt"]:
-        raise ValueError("Non-DNT glossary entries need a nonempty term_tgt.")
     aliases = result["aliases_src"] or ()
     if isinstance(aliases, str):
         aliases = aliases.split("|")
     if not isinstance(aliases, (list, tuple)) or any(not isinstance(item, str) for item in aliases):
         raise ValueError("Glossary aliases_src must be a pipe-separated string or a string list.")
     result["aliases_src"] = tuple(dict.fromkeys(item.strip() for item in aliases if item.strip()))
+    if result["dnt"]:
+        if any(contains_cjk(term) for term in (source, *result["aliases_src"])):
+            raise ValueError(
+                "English output requires DNT terms and aliases in English or Latin script. "
+                "Use a source-to-English glossary mapping for terms that need translation."
+            )
+        if result["term_tgt"] and result["term_tgt"] != source:
+            raise ValueError("DNT entries must preserve term_src exactly in term_tgt.")
+        result["term_tgt"] = source
+    elif not result["term_tgt"]:
+        raise ValueError("Non-DNT glossary entries need a nonempty term_tgt.")
     try:
         result["priority"] = int(str(result["priority"] or 0))
     except (TypeError, ValueError) as exc:

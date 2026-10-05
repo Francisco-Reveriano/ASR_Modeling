@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from src.model_lock import LOCAL_MODEL_LOCK
+from src.translation_validation import contains_cjk
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "Models" / "Hy-MT2-1.8B"
 MAX_NEW_TOKENS = 512
@@ -58,32 +59,53 @@ def translate_with_tencent(text: str) -> str:
 
     Tencent's default translation prompt targets the full language name
     "English". Only newly generated tokens are decoded. Empty or unfinished
-    output raises an error rather than publishing a partial translation.
+    output raises an error rather than publishing a partial translation. Completed
+    output with untranslated source script gets one deterministic English repair
+    from the original source; repeated mixed-script output remains an error.
     """
     if not text.strip():
         raise ValueError("There is no transcript text to translate.")
     with LOCAL_MODEL_LOCK, torch.inference_mode():
         tokenizer, model = _load_model()
-        prompt = (
+        instructions = (
             "Translate the following text into English. Note that you should only "
-            "output the translated result without any additional explanation:\n\n"
-            f"{text}"
+            "output the translated result without any additional explanation. "
+            "Translate every phrase, including technical terms, into English. "
+            "Use English names or Latin transliteration for names with no English form. "
+            "Do not include Chinese or other untranslated source-script words. "
+            "Preserve Latin identifiers and numbers exactly:"
         )
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, return_tensors="pt", return_dict=True,
-        ).to(model.device)
-        output = model.generate(
-            **inputs, max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True, temperature=0.7, top_p=0.6,
-            top_k=20, repetition_penalty=1.05,
-        )
-        generated = output[0, inputs["input_ids"].shape[-1]:]
-        eos = model.generation_config.eos_token_id
-        eos_ids = eos if isinstance(eos, (list, tuple)) else [eos]
-        if not generated.numel() or generated[-1].item() not in eos_ids:
-            raise RuntimeError("The local translation did not finish within its output limit.")
-        translation = tokenizer.decode(generated, skip_special_tokens=True).strip()
-        if not translation:
-            raise RuntimeError("The local translation was empty.")
-        return translation
+        for attempt in range(2):
+            repair = (
+                " Re-translate the original source below into English only. "
+                "The previous attempt left untranslated words. Translate every word and phrase; "
+                "render all names in English or Latin transliteration. "
+                "Never copy Han characters, kana, Bopomofo, or Hangul into the output. "
+                "Keep the original Latin identifiers and numbers exactly. "
+                "Return only the complete English translation."
+            ) if attempt else ""
+            prompt = instructions + repair + "\n\n" + text
+            inputs = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True, return_tensors="pt", return_dict=True,
+            ).to(model.device)
+            sampling = {"do_sample": False} if attempt else {
+                "do_sample": True, "temperature": 0.7, "top_p": 0.6, "top_k": 20,
+            }
+            output = model.generate(
+                **inputs, max_new_tokens=MAX_NEW_TOKENS,
+                repetition_penalty=1.05, **sampling,
+            )
+            generated = output[0, inputs["input_ids"].shape[-1]:]
+            eos = model.generation_config.eos_token_id
+            eos_ids = eos if isinstance(eos, (list, tuple)) else [eos]
+            if not generated.numel() or generated[-1].item() not in eos_ids:
+                raise RuntimeError("The local translation did not finish within its output limit.")
+            translation = tokenizer.decode(generated, skip_special_tokens=True).strip()
+            if not translation:
+                raise RuntimeError("The local translation was empty.")
+            if contains_cjk(translation):
+                if attempt == 0:
+                    continue
+                raise RuntimeError("The local translation was not entirely in English.")
+            return translation

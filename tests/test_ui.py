@@ -1,6 +1,7 @@
 """Check aligned conversation rows, safe model text, and readable downloads."""
 
 from html.parser import HTMLParser
+from copy import deepcopy
 import unittest
 
 from src.ui import export_conversation, render_transcript
@@ -15,6 +16,7 @@ class TranscriptParser(HTMLParser):
         self.tencent_english = []
         self.astra_english = []
         self.astra_statuses = []
+        self.astra_cell_classes = []
         self.segment_ids = []
         self.speakers = []
         self.reference_numbers = []
@@ -49,6 +51,7 @@ class TranscriptParser(HTMLParser):
             self._provider = self.tencent_english
         elif "astra-cell" in classes:
             self._provider = self.astra_english
+            self.astra_cell_classes.append(classes)
         elif "slow-badge" in classes:
             self.astra_statuses.append("")
             self._capture = self.astra_statuses
@@ -80,6 +83,106 @@ class TranscriptParser(HTMLParser):
 
 
 class TranscriptRenderingTests(unittest.TestCase):
+    def test_selected_providers_hide_other_columns_and_download_fields(self):
+        snapshot = {"translations": ["Reviewed English"], "authoritative": ["Reviewed English"],
+                    "statuses": ["corrected"], "segments": [{"segment_id": "s:1"}]}
+        for selected, expected in ((('openai',), (['Fast English'], [], [])),
+                                   (('openai', 'astra'), (['Fast English'], [], ['Reviewed English'])),
+                                   (('tencent',), ([], ['Local English'], [])),
+                                   ((), ([], [], []))):
+            with self.subTest(providers=selected):
+                markup = render_transcript(["Original source"], ["Fast English"], [None],
+                                           ["Local English"], [None], slow_lane=snapshot,
+                                           providers=selected, reference_text="Reference line")
+                parsed = TranscriptParser(markup)
+                self.assertEqual((parsed.english, parsed.tencent_english, parsed.astra_english), expected)
+                self.assertEqual(parsed.segments, ["Original source"])
+                self.assertEqual(parsed.references, ["Reference line"])
+                self.assertIn(f"provider-columns-{len(selected)}", markup)
+                self.assertEqual(markup.count('class="translation-cell '), len(selected))
+                downloaded = export_conversation(["Original source"], ["Fast English"], [None],
+                                                 ["Local English"], [None], slow_lane=snapshot,
+                                                 providers=selected)
+                for provider, label in (("openai", "English (OpenAI)"), ("tencent", "English (Tencent local)"),
+                                        ("astra", "English (Astra correction)")):
+                    self.assertEqual(label in downloaded, provider in selected)
+                self.assertIn("Original: Original source", downloaded)
+
+    def test_provider_selection_rejects_unknown_or_duplicate_values_safely(self):
+        for selected in (("openai", "PRIVATE"), ("openai", "openai"), "openai", ([],)):
+            with self.subTest(providers=selected):
+                for function in (render_transcript, export_conversation):
+                    with self.assertRaisesRegex(ValueError, "providers") as raised:
+                        function([], [], [], providers=selected)
+                    self.assertNotIn("PRIVATE", str(raised.exception))
+
+    def test_first_review_stays_visible_without_final_claim_while_context_review_is_unfinished(self):
+        notes = {"waiting": "Context review pending", "reviewing": "Reviewing in context",
+                 "failed": "Context review failed", "blocked": "Waiting for earlier review"}
+        for stage, note in notes.items():
+            for view in ("speculative", "authoritative"):
+                with self.subTest(stage=stage, view=view):
+                    snapshot = {"translations": ["First reviewed English"], "authoritative": ["First reviewed English"],
+                                "statuses": ["corrected"], "view": view, "segments": [{
+                                    "segment_id": "s:1", "first_pass_status": "corrected",
+                                    "conversation_review_status": stage, "conversation_review_error": "PRIVATE error",
+                                }]}
+                    before = deepcopy(snapshot)
+                    markup = render_transcript(["Original source"], ["Fast draft"], [None], slow_lane=snapshot)
+                    parsed = TranscriptParser(markup)
+                    self.assertEqual(parsed.astra_english, ["First reviewed English"])
+                    self.assertEqual(parsed.astra_statuses, ["Corrected"])
+                    self.assertIn("astra-corrected", parsed.astra_cell_classes[0])
+                    self.assertIn(note, markup)
+                    self.assertNotIn("PRIVATE error", markup)
+                    downloaded = export_conversation(["Original source"], ["Fast draft"], [None], slow_lane=snapshot)
+                    self.assertIn("Astra first review: Corrected", downloaded)
+                    self.assertIn(f"Astra conversation review: {stage.capitalize()}", downloaded)
+                    self.assertNotIn("Final", downloaded)
+                    self.assertEqual(snapshot, before)
+
+    def test_context_review_acceptance_marks_latest_english_without_losing_corrected_hint(self):
+        for stage in ("corrected", "confirmed"):
+            snapshot = {"translations": ["Context-reviewed English"], "authoritative": ["Context-reviewed English"],
+                        "statuses": ["corrected"], "view": "authoritative", "segments": [{
+                            "segment_id": "s:1", "first_pass_status": "corrected",
+                            "conversation_review_status": stage,
+                        }]}
+            markup = render_transcript(["Original source"], ["Fast draft"], [None], slow_lane=snapshot)
+            parsed = TranscriptParser(markup)
+            self.assertEqual(parsed.astra_english, ["Context-reviewed English"])
+            self.assertEqual(parsed.astra_statuses, ["Corrected · Final"])
+            self.assertIn("astra-corrected", parsed.astra_cell_classes[0])
+            self.assertIn("Reviewed in context", markup)
+            self.assertIn('class="context-review-note complete"', markup)
+            snapshot["translations"] = snapshot["authoritative"] = ["仍然中文"]
+            invalid = render_transcript(["Original source"], ["Fast draft"], [None], slow_lane=snapshot)
+            self.assertNotIn("Reviewed in context", invalid)
+            self.assertNotIn('astra-cell astra-corrected', invalid)
+
+    def test_filtered_background_is_visible_as_filtered_without_a_correction_badge(self):
+        marker = "[Background speech filtered]"
+        snapshot = {
+            "translations": [marker], "authoritative": [marker], "statuses": ["filtered"],
+            "segments": [{"segment_id": "s:1", "source_text": "Background speech", "filtered": True}],
+        }
+        for view in ("screen", "authoritative"):
+            with self.subTest(view=view):
+                state = dict(snapshot, view=view)
+                rendered = TranscriptParser(render_transcript(
+                    ["Background speech"], [marker], tencent_translations=["Local translation."], slow_lane=state,
+                ))
+                self.assertEqual(rendered.english, [marker])
+                self.assertEqual(rendered.tencent_english, ["Local translation."])
+                self.assertEqual(rendered.astra_english, [marker])
+                self.assertEqual(rendered.astra_statuses, [
+                    "Background filtered" + (" · Final" if view == "authoritative" else ""),
+                ])
+                self.assertNotIn("astra-corrected", rendered.astra_cell_classes[0])
+                self.assertIn("Original: Background speech", export_conversation(
+                    ["Background speech"], [marker], [], slow_lane=state,
+                ))
+
     def test_each_segment_gets_a_stable_number_as_new_segments_arrive(self):
         texts = ["第一段話。", "A second spoken segment."]
         initial = TranscriptParser(render_transcript(texts))
@@ -238,10 +341,10 @@ class TranscriptRenderingTests(unittest.TestCase):
         final_snapshot = dict(snapshot, view="authoritative")
         final = TranscriptParser(render_transcript(["原文"], slow_lane=final_snapshot))
 
-        self.assertEqual(live.astra_english, ["A later correction."])
+        self.assertEqual(live.astra_english, ["The sealed version."])
         self.assertEqual(live.astra_statuses, ["Corrected"])
         self.assertEqual(final.astra_english, ["The sealed version."])
-        self.assertEqual(final.astra_statuses, ["Final · Stored version"])
+        self.assertEqual(final.astra_statuses, ["Corrected · Final"])
         self.assertEqual(final.segment_ids, ["segment-17"])
         for state in (snapshot, final_snapshot):
             exported = export_conversation(["原文"], [], [], slow_lane=state)
@@ -250,7 +353,7 @@ class TranscriptRenderingTests(unittest.TestCase):
             self.assertIn("Segment ID: segment-17", exported)
             self.assertIn("Astra status:", exported)
 
-    def test_late_accepted_correction_is_final_without_relabelling_unchanged_screen_text(self):
+    def test_late_accepted_correction_replaces_the_live_draft_and_is_labelled_corrected(self):
         snapshot = {
             "translations": ["Fast draft."], "statuses": ["corrected"],
             "authoritative": ["A later accepted correction."],
@@ -261,13 +364,13 @@ class TranscriptRenderingTests(unittest.TestCase):
             ["原文"], slow_lane=dict(snapshot, view="authoritative"),
         ))
 
-        self.assertEqual(live.astra_english, ["Fast draft."])
-        self.assertEqual(live.astra_statuses, ["Draft · Final correction available"])
+        self.assertEqual(live.astra_english, ["A later accepted correction."])
+        self.assertEqual(live.astra_statuses, ["Corrected"])
         self.assertEqual(final.astra_english, ["A later accepted correction."])
         self.assertEqual(final.astra_statuses, ["Corrected · Final"])
         exported = export_conversation(["原文"], [], [], slow_lane=snapshot)
-        self.assertIn("English (Astra correction): Fast draft.", exported)
-        self.assertIn("Astra authoritative: A later accepted correction.", exported)
+        self.assertIn("English (Astra correction): A later accepted correction.", exported)
+        self.assertIn("Astra latest visible version: Fast draft.", exported)
 
     def test_authoritative_view_keeps_unsealed_rows_pending(self):
         rendered = TranscriptParser(render_transcript(
@@ -280,6 +383,61 @@ class TranscriptRenderingTests(unittest.TestCase):
 
         self.assertEqual(rendered.astra_english, ["Awaiting final text…"])
         self.assertEqual(rendered.astra_statuses, ["Pending final"])
+
+    def test_only_accepted_english_corrections_tint_the_astra_cell_in_both_views(self):
+        snapshot = {
+            "translations": [
+                "An older draft.", "Confirmed English.", "A failed draft.", None,
+                "Mixed 中文.", "Literal source", "Unsealed English.",
+            ],
+            "authoritative": [
+                "Accepted English correction.", "Confirmed English.", "A failed draft.", None,
+                "Mixed 中文.", "Literal source", None,
+            ],
+            "statuses": ["corrected", "confirmed", "failed", "waiting", "corrected", "corrected", "corrected"],
+            "segments": [{"source_fallback": index == 5} for index in range(7)],
+        }
+        for view in ("screen", "authoritative"):
+            with self.subTest(view=view):
+                rendered = TranscriptParser(render_transcript(
+                    [f"Original {index}" for index in range(7)], slow_lane=dict(snapshot, view=view),
+                ))
+
+                self.assertEqual(
+                    ["astra-corrected" in classes for classes in rendered.astra_cell_classes],
+                    [True, False, False, False, False, False, False],
+                )
+                self.assertEqual(rendered.astra_english[0], "Accepted English correction.")
+                self.assertEqual(
+                    rendered.astra_statuses[0], "Corrected · Final" if view == "authoritative" else "Corrected",
+                )
+
+    def test_failed_final_review_requests_retry_without_displaying_a_draft_or_source(self):
+        texts = ["第一句", "原文失敗", "等候翻譯", "審閱中"]
+        snapshot = {
+            "translations": ["An English draft.", "原文失敗", "等候翻譯", "A pending draft."],
+            "authoritative": [None] * 4,
+            "statuses": ["failed", "failed", "failed", "draft"],
+            "segments": [
+                {"error": "Correction failed."},
+                {"error": "Correction failed.", "source_fallback": True},
+                {"error": None, "source_fallback": True},
+                {"error": None},
+            ],
+            "view": "authoritative",
+        }
+        rendered = TranscriptParser(render_transcript(texts, slow_lane=snapshot))
+
+        self.assertEqual(rendered.astra_statuses, ["Review failed", "Review failed", "Pending final", "Pending final"])
+        self.assertEqual(rendered.astra_english, [
+            "Retry correction to finish this translation.", "Retry correction to finish this translation.",
+            "Awaiting final text…", "Awaiting final text…",
+        ])
+        self.assertEqual(rendered.segments, texts)
+        self.assertFalse(any("astra-corrected" in classes for classes in rendered.astra_cell_classes))
+        exported = export_conversation(texts, [], [], slow_lane=snapshot)
+        self.assertIn("English (Astra correction): [Retry correction to finish this translation.]", exported)
+        self.assertEqual(exported.count("原文失敗"), 1)
 
     def test_degraded_reviews_keep_fallbacks_honest_and_missing_rows_visible(self):
         snapshot = {
@@ -335,7 +493,7 @@ class TranscriptRenderingTests(unittest.TestCase):
         self.assertEqual(rendered.astra_english, [])
         self.assertEqual(rendered.references, ["A reference remains available."])
 
-    def test_source_fallback_is_not_labelled_an_english_draft(self):
+    def test_source_fallback_stays_only_in_original_column_and_download_field(self):
         snapshot = {
             "translations": ["原始語音文字"], "authoritative": ["原始語音文字"],
             "statuses": ["failed"],
@@ -347,15 +505,84 @@ class TranscriptRenderingTests(unittest.TestCase):
             ["原始語音文字"], slow_lane=dict(snapshot, view="authoritative"),
         ))
 
-        self.assertEqual(rendered.astra_english, ["原始語音文字"])
-        self.assertEqual(rendered.astra_statuses, ["Source fallback"])
-        self.assertEqual(final.astra_statuses, ["Final · Source fallback"])
+        self.assertEqual(rendered.astra_english, ["Translation unavailable"])
+        self.assertEqual(final.astra_english, ["Translation unavailable"])
+        self.assertEqual(rendered.astra_statuses, ["Translation unavailable"])
+        self.assertEqual(final.astra_statuses, ["Translation unavailable · Final"])
+        self.assertEqual(rendered.segments, ["原始語音文字"])
+        self.assertEqual(final.segments, ["原始語音文字"])
         self.assertNotIn('class="translation-text astra-text" lang="en"', markup)
-        self.assertIn("Astra status: Source fallback", export_conversation(
-            ["原始語音文字"], [], [], slow_lane=snapshot,
-        ))
+        for state in (snapshot, dict(snapshot, view="authoritative")):
+            exported = export_conversation(["原始語音文字"], [], [], slow_lane=state)
+            self.assertEqual(exported.count("原始語音文字"), 1)
+            self.assertIn("Original: 原始語音文字", exported)
+            self.assertIn("English (Astra correction): [Translation unavailable]", exported)
+            self.assertIn("Astra status: Translation unavailable", exported)
 
-    def test_late_english_correction_preserves_source_fallback_label_on_stable_screen(self):
+    def test_legacy_mixed_script_provider_outputs_are_not_presented_as_english(self):
+        texts = ["上禮拜三那批布拉吉", "第二句"]
+        mixed = "That batch of布拉吉 from last Wednesday."
+        rendered = TranscriptParser(render_transcript(
+            texts, [mixed, "Second sentence."],
+            tencent_translations=[mixed, "The next sentence."],
+        ))
+        self.assertEqual(rendered.english, ["Translation unavailable", "Second sentence."])
+        self.assertEqual(rendered.tencent_english, ["Translation unavailable", "The next sentence."])
+        self.assertEqual(rendered.segments, texts)
+        exported = export_conversation(texts, [mixed, "Second sentence."], [], [mixed, "The next sentence."])
+        self.assertNotIn(mixed, exported)
+        self.assertEqual(exported.count("[Translation unavailable]"), 2)
+        self.assertIn(f"Original: {texts[0]}", exported)
+
+    def test_invalid_astra_targets_are_unavailable_in_both_views_without_mutating_snapshot(self):
+        texts = ["第一句", "第二句", "第三句", "Literal original"]
+        snapshot = {
+            "translations": ["That batch of布拉吉.", "Confirmed 中文.", "Corrected 中文.", "Literal original"],
+            "authoritative": ["That batch of布拉吉.", "Confirmed 中文.", "Corrected 中文.", "Literal original"],
+            "statuses": ["timeout", "confirmed", "corrected", "failed"],
+            "segments": [
+                {"segment_id": f"segment-{index}", "source_text": text, "source_fallback": index == 3}
+                for index, text in enumerate(texts)
+            ],
+        }
+        original = deepcopy(snapshot)
+        for view in ("screen", "authoritative"):
+            with self.subTest(view=view):
+                state = dict(snapshot, view=view)
+                rendered = TranscriptParser(render_transcript(texts, slow_lane=state))
+                self.assertEqual(rendered.astra_english, ["Translation unavailable"] * 4)
+                label = "Translation unavailable" + (" · Final" if view == "authoritative" else "")
+                self.assertEqual(rendered.astra_statuses, [label] * 4)
+                self.assertEqual(rendered.segments, texts)
+                self.assertEqual(rendered.segment_ids, [f"segment-{index}" for index in range(4)])
+                exported = export_conversation(texts, [], [], slow_lane=state)
+                for target in snapshot["authoritative"][:3]:
+                    self.assertNotIn(target, exported)
+                self.assertEqual(exported.count("Literal original"), 1)
+        self.assertEqual(snapshot, original)
+
+    def test_download_supplementary_versions_never_leak_untranslated_source(self):
+        snapshot = {
+            "translations": ["原始語音文字", "An English draft."],
+            "authoritative": ["An English correction.", "Stored 中文."],
+            "statuses": ["corrected", "timeout"],
+            "segments": [
+                {"source_text": "原始語音文字", "source_fallback": False, "screen_source_fallback": True},
+                {"source_text": "第二句", "source_fallback": False},
+            ],
+        }
+        for view in ("screen", "authoritative"):
+            with self.subTest(view=view):
+                exported = export_conversation(
+                    ["原始語音文字", "第二句"], [], [], slow_lane=dict(snapshot, view=view),
+                )
+                self.assertEqual(exported.count("原始語音文字"), 1)
+                self.assertNotIn("Stored 中文.", exported)
+                self.assertIn("English (Astra correction): An English correction.", exported)
+                self.assertIn("Astra latest visible version: [Translation unavailable]", exported)
+                self.assertIn("Astra authoritative: [Translation unavailable]", exported)
+
+    def test_late_english_correction_replaces_source_fallback_on_screen(self):
         snapshot = {
             "translations": ["原始語音文字"], "authoritative": ["An English correction."],
             "statuses": ["corrected"],
@@ -370,8 +597,9 @@ class TranscriptRenderingTests(unittest.TestCase):
             ["原始語音文字"], slow_lane=dict(snapshot, view="authoritative"),
         ))
 
-        self.assertEqual(live.astra_statuses, ["Source fallback"])
-        self.assertNotIn('class="translation-text astra-text" lang="en"', markup)
+        self.assertEqual(live.astra_english, ["An English correction."])
+        self.assertEqual(live.astra_statuses, ["Corrected"])
+        self.assertIn('class="translation-text astra-text" lang="en"', markup)
         self.assertEqual(final.astra_english, ["An English correction."])
         self.assertEqual(final.astra_statuses, ["Corrected · Final"])
 

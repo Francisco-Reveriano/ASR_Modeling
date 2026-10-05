@@ -163,6 +163,72 @@ class TencentTranslationTests(unittest.TestCase):
 
         self.assertEqual(tencent.translate_with_tencent("你好。"), "The train leaves at 8.")
 
+    def test_mixed_language_translation_gets_one_deterministic_repair_from_original_source(self):
+        text = "原始 source ETCH-07"
+        self.tokenizer.decode.side_effect = ["PRIVATE 工序 for ETCH-07.", "The ETCH-07 process."]
+
+        result = tencent.translate_with_tencent(text)
+
+        self.assertEqual(result, "The ETCH-07 process.")
+        self.assertEqual(self.model.generate.call_count, 2)
+        first, repair = [call.kwargs for call in self.model.generate.call_args_list]
+        self.assertTrue(first["do_sample"])
+        self.assertEqual(first["temperature"], 0.7)
+        self.assertEqual(first["top_p"], 0.6)
+        self.assertEqual(first["top_k"], 20)
+        self.assertIs(repair["do_sample"], False)
+        self.assertEqual(repair["max_new_tokens"], tencent.MAX_NEW_TOKENS)
+        self.assertNotIn("temperature", repair)
+        self.assertNotIn("top_p", repair)
+        self.assertNotIn("top_k", repair)
+        first_prompt, repair_prompt = [
+            call.args[0][0]["content"] for call in self.tokenizer.apply_chat_template.call_args_list
+        ]
+        self.assertNotEqual(first_prompt, repair_prompt)
+        self.assertTrue(first_prompt.endswith(text))
+        self.assertTrue(repair_prompt.endswith(text))
+        self.assertIn("English only", repair_prompt)
+        self.assertNotIn("PRIVATE", repair_prompt)
+
+    def test_repeated_mixed_language_translation_is_rejected_after_one_repair(self):
+        self.tokenizer.decode.return_value = "PRIVATE 工序 is complete."
+
+        with self.assertRaisesRegex(RuntimeError, "English") as caught:
+            tencent.translate_with_tencent("PRIVATE SOURCE")
+
+        self.assertNotIn("PRIVATE", str(caught.exception))
+        self.assertEqual(self.model.generate.call_count, 2)
+
+    def test_incomplete_repair_never_publishes_a_partial_translation(self):
+        self.tokenizer.decode.return_value = "Mixed 工序."
+        self.model.generate.side_effect = [
+            torch.tensor([[1, 2, 3, 7, 8, 9]]),
+            torch.tensor([[1, 2, 3, 7, 8]]),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "did not finish"):
+            tencent.translate_with_tencent("source")
+
+        self.assertEqual(self.model.generate.call_count, 2)
+        self.tokenizer.decode.assert_called_once()
+
+    def test_generation_failure_is_not_retried(self):
+        self.model.generate.side_effect = RuntimeError("Local generation failure")
+
+        with self.assertRaises(RuntimeError):
+            tencent.translate_with_tencent("source")
+
+        self.model.generate.assert_called_once()
+
+    def test_prompt_requires_english_and_latin_names_without_changing_english_identifiers(self):
+        self.tokenizer.decode.return_value = "José checks ETCH-07 at 8."
+
+        self.assertEqual(tencent.translate_with_tencent("檢查 ETCH-07。"), "José checks ETCH-07 at 8.")
+
+        prompt = self.tokenizer.apply_chat_template.call_args.args[0][0]["content"]
+        self.assertIn("English", prompt)
+        self.assertIn("Latin", prompt)
+
     def test_concurrent_calls_share_one_load_and_do_not_overlap_generation(self):
         loading, release, second_started = Event(), Event(), Event()
         results, errors = [], []

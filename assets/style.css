@@ -290,7 +290,7 @@ h1 {
 
 .transcript-lines .transcript-row {
     display: grid;
-    grid-template-columns: 1.7rem repeat(3, minmax(0, 1fr));
+    grid-template-columns: 1.7rem repeat(var(--transcript-columns, 3), minmax(0, 1fr));
     gap: 1.2rem;
     margin: 0;
     padding: 1.05rem 0.4rem;
@@ -299,7 +299,7 @@ h1 {
 
 .conversation-columns {
     display: grid;
-    grid-template-columns: 1.7rem repeat(3, minmax(0, 1fr));
+    grid-template-columns: 1.7rem repeat(var(--transcript-columns, 3), minmax(0, 1fr));
     gap: 1.2rem;
     padding: 0.8rem 0.4rem;
     border-bottom: 1px solid var(--line);
@@ -310,9 +310,14 @@ h1 {
 
 .conversation-columns.has-slow-lane,
 .transcript-lines.has-slow-lane .transcript-row {
-    grid-template-columns: 1.7rem repeat(4, minmax(0, 1fr));
+    grid-template-columns: 1.7rem repeat(var(--transcript-columns, 4), minmax(0, 1fr));
     gap: 0.9rem;
 }
+
+.provider-columns-0 { --transcript-columns: 1; }
+.provider-columns-1 { --transcript-columns: 2; }
+.provider-columns-2 { --transcript-columns: 3; }
+.provider-columns-3 { --transcript-columns: 4; }
 
 .has-slow-lane .translation-cell,
 .conversation-columns.has-slow-lane > span:nth-child(n + 3) {
@@ -399,6 +404,29 @@ h1 {
 
 .astra-cell .translation-text {
     color: #754689;
+}
+
+.astra-cell.astra-corrected {
+    background: #edf7f0;
+    border-left-color: #d7e9dd;
+    border-radius: 6px;
+    box-shadow: inset 0 0 0 1px rgb(75 127 91 / 8%);
+}
+
+.context-review-note {
+    display: block;
+    margin: -0.1rem 0 0.5rem;
+    color: var(--muted);
+    font-size: 0.68rem;
+    line-height: 1.4;
+}
+
+.context-review-note.complete {
+    color: #52725e;
+}
+
+.context-review-note.fallback {
+    color: #805b16;
 }
 
 .slow-badge, .speaker-label {
@@ -510,7 +538,7 @@ h1 {
     font-size: 0.75rem;
 }
 
-/* Four model columns keep the independently numbered reference below them. */
+/* Four transcript columns keep the independently numbered reference below them. */
 .conversation-reference.has-slow-lane,
 .conversation-reference.has-slow-lane > .model-conversation,
 .conversation-reference.has-slow-lane > .reference-pane {
@@ -578,26 +606,26 @@ h1 {
 }
 
 @container (max-width: 920px) {
-    .conversation-columns.has-slow-lane {
+    .conversation-columns.provider-columns-3 {
         display: none;
     }
 
-    .transcript-lines.has-slow-lane .transcript-row {
+    .transcript-lines.provider-columns-3 .transcript-row {
         grid-template-columns: 1.7rem minmax(0, 1fr);
         gap: 0.8rem;
     }
 
-    .transcript-lines.has-slow-lane .line-number {
-        grid-row: 1 / 5;
+    .transcript-lines.provider-columns-3 .line-number {
+        grid-row: 1 / span var(--transcript-columns, 4);
     }
 
-    .has-slow-lane .translation-cell {
+    .provider-columns-3 .translation-cell {
         grid-column: 2;
         border-left: 0;
         padding-left: 0;
     }
 
-    .has-slow-lane .cell-label {
+    .provider-columns-3 .cell-label {
         display: block;
     }
 }
@@ -607,13 +635,14 @@ h1 {
         display: none;
     }
 
-    .transcript-lines .transcript-row {
+    .transcript-lines .transcript-row,
+    .transcript-lines.has-slow-lane .transcript-row {
         grid-template-columns: 1.7rem minmax(0, 1fr);
         gap: 0.8rem;
     }
 
     .line-number {
-        grid-row: 1 / 4;
+        grid-row: 1 / span var(--transcript-columns, 3);
     }
 
     .translation-cell {

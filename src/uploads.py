@@ -14,6 +14,7 @@ import torch
 from src.pipeline import SAMPLE_RATE, SPEECH_PAD_MS
 
 MAX_SEGMENT_SECONDS = 15
+WAV_BLOCK_FRAMES = 65_536
 
 
 def transcribe_in_background(transcribe, audio):
@@ -41,8 +42,8 @@ def transcribe_in_background(transcribe, audio):
 def decode_wav(data: bytes) -> np.ndarray:
     """Decode WAV bytes to contiguous mono float32 audio at 16 kHz.
 
-    PCM and floating-point WAV files, including WAVEX and RF64, are read
-    entirely in memory. Channels are averaged before resampling. Invalid,
+    PCM and floating-point WAV files, including WAVEX and RF64, are decoded
+    in bounded blocks in memory. Channels are averaged before resampling. Invalid,
     empty, non-WAV, or nonfinite audio raises ValueError. Silence is valid.
     This helper neither loads models nor writes uploaded audio to disk.
     """
@@ -51,16 +52,29 @@ def decode_wav(data: bytes) -> np.ndarray:
             if source.format not in {"WAV", "WAVEX", "RF64"}:
                 raise ValueError("Please upload a WAV audio file.")
             sample_rate = source.samplerate
-            samples = source.read(dtype="float32", always_2d=True)
+            audio = np.empty(source.frames, dtype=np.float32)
+            offset = 0
+            while offset < len(audio):
+                samples = source.read(
+                    frames=min(WAV_BLOCK_FRAMES, len(audio) - offset),
+                    dtype="float32", always_2d=True,
+                )
+                if not len(samples):
+                    del samples
+                    break
+                if not np.isfinite(samples).all():
+                    raise ValueError("The WAV file contains nonfinite audio samples.")
+                stop = offset + len(samples)
+                audio[offset:stop] = samples.mean(axis=1)
+                offset = stop
+                del samples
+            # A truncated stream can end before its advertised frame count.
+            audio.resize(offset, refcheck=False)
     except sf.SoundFileError as exc:
         raise ValueError("Could not read this WAV file. It may be invalid or corrupted.") from exc
 
-    if not len(samples):
+    if not len(audio):
         raise ValueError("The WAV file is empty and contains no audio samples.")
-    if not np.isfinite(samples).all():
-        raise ValueError("The WAV file contains nonfinite audio samples.")
-
-    audio = samples.mean(axis=1)
     if sample_rate != SAMPLE_RATE:
         divisor = gcd(sample_rate, SAMPLE_RATE)
         audio = resample_poly(audio, SAMPLE_RATE // divisor, sample_rate // divisor)

@@ -1,15 +1,18 @@
 """Verify Streamlit recording state without models or microphone access."""
 
 from io import BytesIO
+import gc
 import json
+import os
 from pathlib import Path
 import re
-from threading import Event
+from threading import Event, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import wave
+import weakref
 
 import av
 import numpy as np
@@ -42,15 +45,18 @@ class FakeTranslationSession:
 
     def __init__(self, translate=None, *, failure_message=None, glossary=None,
                  source_lang="zh-TW+en", target_lang="en", initial_results=None,
-                 initial_errors=None):
+                 initial_errors=None, initial_filtered=None, on_result=None):
         self.translate = translate
         self.failure_message = failure_message
         self.provider = "Tencent" if translate is not None else "English"
         self.initial_results = initial_results
         self.initial_errors = initial_errors or []
+        self.initial_filtered = initial_filtered or []
         self.sources = []
         self.translations = []
         self.errors = []
+        self.filtered = []
+        self.on_result = on_result
         self.submit = Mock(side_effect=self._submit)
         self.retry_failed = Mock(side_effect=self._retry_failed)
         self.close = Mock()
@@ -64,6 +70,13 @@ class FakeTranslationSession:
                 else f"{self.provider} segment {len(self.sources)}."
             )
             self.errors.append(self.initial_errors[index] if index < len(self.initial_errors) else None)
+            self.filtered.append(self.initial_filtered[index] if index < len(self.initial_filtered) else False)
+            if self.on_result is not None and (self.translations[index] is not None or self.errors[index]):
+                try:
+                    self.on_result(self.sources.copy(), self.snapshot())
+                except Exception:
+                    # The real provider isolates observers and polling recovers.
+                    pass
 
     def _retry_failed(self):
         self.errors = [None for _ in self.errors]
@@ -72,6 +85,7 @@ class FakeTranslationSession:
         return {
             "translations": self.translations.copy(),
             "errors": self.errors.copy(),
+            "filtered": self.filtered.copy(),
             "pending": sum(
                 text is None and error is None
                 for text, error in zip(self.translations, self.errors)
@@ -84,6 +98,12 @@ class RecordingAppTests(unittest.TestCase):
         st.cache_resource.clear()
         self.addCleanup(st.cache_resource.clear)
         self.start_patch("dotenv.load_dotenv", return_value=False)
+        self.start_patch("src.reasoning.load_dotenv", return_value=False)
+        self.enterContext(patch.dict(os.environ, {
+            "OPENAI_CORRECTION_MODEL": "", "OPENAI_CORRECTION_REASONING_EFFORT": "",
+            "OPENAI_CORRECTION_MAX_OUTPUT_TOKENS": "",
+            "OPENAI_FILTER_BACKGROUND_SPEECH": "",
+        }))
         self.transcribe = Mock(return_value="A short transcript")
         self.vad = Mock(return_value=None)
         self.context = SimpleNamespace(
@@ -122,7 +142,8 @@ class RecordingAppTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return patcher.start()
 
-    def configure_translations(self, *, openai=None, tencent=None, openai_errors=None, tencent_errors=None):
+    def configure_translations(self, *, openai=None, tencent=None, openai_errors=None, tencent_errors=None,
+                               openai_filtered=None):
         """Publish chosen fake outcomes on first submission, just like a real worker."""
         self.translation_sessions = {}
 
@@ -131,6 +152,7 @@ class RecordingAppTests(unittest.TestCase):
                 translate, **kwargs,
                 initial_results=tencent if translate is not None else openai,
                 initial_errors=tencent_errors if translate is not None else openai_errors,
+                initial_filtered=openai_filtered if translate is None else None,
             )
             self.translation_sessions["tencent" if translate is not None else "openai"] = session
             return session
@@ -145,6 +167,10 @@ class RecordingAppTests(unittest.TestCase):
                 return snapshot
             sleep(0.005)
         self.fail("The mocked correction worker did not drain.")
+
+    def review_requests(self, *, conversation=False):
+        return [call.args[0] for call in self.correct.call_args_list
+                if (call.args[0].get("review_stage") == "conversation") == conversation]
 
     def finish_current_recording(self):
         if "recording" in self.app.session_state:
@@ -215,6 +241,32 @@ class RecordingAppTests(unittest.TestCase):
         )
         return downloads
 
+    def track_upload_audio(self, *, silent=False):
+        """Track real decoded arrays without mock call histories retaining them."""
+        from src.uploads import decode_wav
+
+        decoded, views = [], []
+
+        def decode(data):
+            audio = decode_wav(data)
+            decoded.append(weakref.ref(audio))
+            return audio
+
+        def split(audio, vad, *, with_timestamps):
+            segments = []
+            for start in (() if silent else (0, 800)):
+                samples = audio[start:start + 800]
+                views.append(weakref.ref(samples))
+                segments.append({"audio": samples, "start_s": start / 16000,
+                                 "end_s": (start + 800) / 16000})
+            return segments
+
+        self.start_patch("src.uploads.decode_wav", new=decode)
+        self.start_patch("src.uploads.speech_segments", new=split)
+        self.load_transcriber.return_value = lambda audio: "Hello"
+        self.diarization.push = lambda audio: None
+        return decoded, views
+
     def test_initial_page_waits_for_start_without_loading_models(self):
         self.assertEqual(self.app.title[0].value, "Voice transcription & translation")
         self.assertFalse(self.app.button(key="start_recording").disabled)
@@ -225,6 +277,96 @@ class RecordingAppTests(unittest.TestCase):
         self.load_vad.assert_not_called()
         self.webrtc.assert_not_called()
         self.make_translation.assert_not_called()
+
+    def test_microphone_translation_type_is_available_before_start(self):
+        control = self.app.selectbox(key="microphone_translation_type")
+        self.assertEqual(control.label, "Translation type")
+        self.assertEqual(control.value, "Compare all translations")
+        self.assertEqual(control.options, [
+            "Compare all translations", "Fast English", "Corrected English", "Fully reviewed English",
+        ])
+        self.assertFalse(control.disabled)
+        self.make_translation.assert_not_called()
+
+    def test_fast_microphone_mode_creates_only_openai_and_stays_frozen(self):
+        self.app.selectbox(key="microphone_translation_type").set_value("Fast English").run()
+        self.vad.side_effect = [{"start": 0}, None]
+        session = self.start_recording()
+        self.assertTrue(self.app.selectbox(key="microphone_translation_type").disabled)
+        self.assertEqual(self.make_translation.call_count, 1)
+        self.assertNotIn("tencent_translation", self.app.session_state)
+        self.assertNotIn("slow_lane", self.app.session_state)
+        self.assertIsNone(self.app.session_state["translation"].on_result)
+        self.assertEqual(self.app.session_state["translation_config"]["providers"], ("openai",))
+        self.app.toggle(key="enable_corrections").set_value(False).run()
+        self.app.toggle(key="enable_corrections").set_value(True).run()
+        self.assertNotIn("slow_lane", self.app.session_state)
+        self.assertNotIn("Astra · Ready", self.rendered_text())
+        frame = av.AudioFrame.from_ndarray(
+            np.ones((1, 800), dtype=np.float32), format="fltp", layout="mono",
+        )
+        frame.sample_rate = 16_000
+        session.push(frame)
+        self.app.button(key="stop_recording").click().run()
+        session._worker.join(timeout=5)
+        downloads = self.capture_downloads()
+        self.app.run()
+        self.assertIn("English segment 1.", self.transcript_html())
+        self.assertNotIn('class="translation-cell tencent-cell"', self.transcript_html())
+        self.assertNotIn('class="translation-cell astra-cell', self.transcript_html())
+        self.assertNotIn("Tencent", downloads[-1])
+        self.assertNotIn("Astra", downloads[-1])
+        self.correct.assert_not_called()
+        self.app.selectbox(key="microphone_translation_type").set_value("Fully reviewed English").run()
+        self.assertEqual(self.app.session_state["translation_config"]["type"], "Fast English")
+        self.assertEqual(self.make_translation.call_count, 1)
+        self.assertNotIn('class="translation-cell astra-cell', self.transcript_html())
+        self.assertNotIn("Tencent", downloads[-1])
+        self.assertNotIn("Astra", downloads[-1])
+
+    def test_corrected_microphone_mode_uses_only_first_astra_review(self):
+        self.app.selectbox(key="microphone_translation_type").set_value("Corrected English").run()
+        self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+        selected = self.app.session_state["translation_config"]
+        self.assertEqual(selected["providers"], ("openai", "astra"))
+        self.assertFalse(selected["second_review"])
+        self.assertEqual(self.make_translation.call_count, 1)
+        self.assertNotIn("tencent_translation", self.app.session_state)
+        lane.submit(["Hello"], ["Hello"])
+        snapshot = self.wait_for_corrections()
+        self.assertEqual(snapshot["statuses"], ["confirmed"])
+        self.assertNotIn("conversation_review", snapshot)
+        self.assertEqual(self.correct.call_count, 1)
+
+    def test_fully_reviewed_microphone_mode_uses_both_reviews_without_tencent(self):
+        self.app.selectbox(key="microphone_translation_type").set_value("Fully reviewed English").run()
+        self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+        self.assertTrue(self.app.session_state["translation_config"]["second_review"])
+        self.assertEqual(self.make_translation.call_count, 1)
+        self.assertNotIn("tencent_translation", self.app.session_state)
+        lane.submit(["Hello"], ["Hello"])
+        snapshot = self.wait_for_corrections()
+        self.assertEqual(snapshot["conversation_review"]["reviewed"], 1)
+        self.assertEqual(snapshot["first_pass"]["statuses"], ["confirmed"])
+        self.assertEqual(self.correct.call_count, 2)
+        self.assertEqual(self.correct.call_args_list[1].args[0]["review_stage"], "conversation")
+
+    def test_upload_ignores_microphone_mode_and_keeps_both_review_stages(self):
+        self.app.selectbox(key="microphone_translation_type").set_value("Fast English").run()
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)])
+        self.select_wav()
+        self.transcribe_file()
+        snapshot = self.wait_for_corrections()
+        self.assertEqual(self.app.session_state["translation_config"]["type"], "Compare all translations")
+        self.assertEqual(self.make_translation.call_count, 2)
+        self.assertTrue(snapshot["conversation_review"]["enabled"])
+        self.assertEqual(snapshot["conversation_review"]["reviewed"], 1)
+        self.app.run()
+        self.assertIn("Conversation review 1/1", self.rendered_text())
+        self.app.selectbox(key="microphone_translation_type").set_value("Corrected English").run()
+        self.assertEqual(self.app.session_state["translation_config"]["type"], "Compare all translations")
 
     def test_start_and_reruns_reuse_recording_without_starting_a_worker(self):
         session = self.start_recording()
@@ -398,6 +540,59 @@ class RecordingAppTests(unittest.TestCase):
         self.assertIsNot(self.app.session_state["translation"], failed_translation)
         self.assertIsNot(self.app.session_state["tencent_translation"], failed_tencent)
 
+    def test_completed_upload_releases_audio_and_keeps_evaluation_after_replacement(self):
+        decoded, views = self.track_upload_audio()
+        downloads = self.capture_downloads()
+        self.select_evaluation(b"Hello Hello")
+        self.evaluate_file()
+        original = self.app.session_state["upload_state"]
+
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in decoded + views))
+        self.assertEqual(original["texts"], ["Hello", "Hello"])
+        self.assertEqual([timing["start_s"] for timing in original["timings"]], [0.0, 0.05])
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "100.0%"})
+        self.assertFalse(self.app.download_button(key="download_transcript").disabled)
+        self.assertTrue(any("Hello" in content and "English segment 1." in content
+                            for content in downloads if isinstance(content, str)))
+
+        self.select_evaluation(b"Hello Hello", audio_name="replacement.wav")
+        self.evaluate_file()
+        gc.collect()
+        self.assertEqual(len(decoded), 2)
+        self.assertTrue(all(reference() is None for reference in decoded + views))
+        self.assertIsNot(self.app.session_state["upload_state"], original)
+        self.assertEqual(original["name"], "evaluation.wav")
+        self.assertEqual(original["texts"], ["Hello", "Hello"])
+        self.assertEqual(self.app.session_state["upload_state"]["name"], "replacement.wav")
+
+    def test_failed_upload_releases_audio_but_preserves_partial_text(self):
+        decoded, views = self.track_upload_audio()
+        calls = 0
+
+        def transcribe(audio):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("inference unavailable")
+            return "Hello"
+
+        self.load_transcriber.return_value = transcribe
+        self.select_evaluation(b"Hello Hello")
+        self.evaluate_file()
+
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in decoded + views))
+        state = self.app.session_state["upload_state"]
+        self.assertEqual(state["texts"], ["Hello"])
+        self.assertEqual(len(state["timings"]), 1)
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["pending"], 0)
+        self.assertIn("inference unavailable", state["error"])
+        self.assertEqual(self.evaluation_scores(), {"Breeze · 1-wMER": "—"})
+        self.assertFalse(self.app.download_button(key="download_transcript").disabled)
+        self.assertNotIn("upload_job", self.app.session_state)
+
     def test_upload_resumes_after_rerun_without_repeating_completed_segments(self):
         from src.ui import render_transcript
 
@@ -467,6 +662,25 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(translation.sources, ["你好。", "食飽未？"])
         self.assertEqual(tencent.sources, ["你好。", "食飽未？"])
 
+    def test_upload_preserves_filtered_source_without_scheduling_astra_review(self):
+        self.configure_translations(
+            openai=["[Background speech filtered]"], openai_filtered=[True],
+            tencent=["Unrelated background conversation."],
+        )
+        self.start_patch("src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)])
+        self.transcribe.return_value = "Background source speech"
+        self.select_wav()
+        self.transcribe_file()
+        final = self.wait_for_corrections()
+        self.app.run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual(final["statuses"], ["filtered"])
+        self.assertEqual(final["pending"], 0)
+        self.correct.assert_not_called()
+        self.assertIn("Background source speech", self.transcript_html())
+        self.assertIn("Background filtered", self.transcript_html())
+        self.assertIn("Unrelated background conversation.", self.transcript_html())
+
     def test_pending_and_failed_translations_keep_originals_and_allow_retry(self):
         self.configure_translations(
             openai=[None, None], openai_errors=[None, "Translation service unavailable"],
@@ -503,6 +717,52 @@ class RecordingAppTests(unittest.TestCase):
         self.assertIn("First English.", self.transcript_html())
         self.assertIn("Second English.", self.transcript_html())
         self.assertEqual(len(self.app.warning), 0)
+
+    def test_uploaded_source_never_appears_as_english_when_astra_recovers_fast_failure(self):
+        source = "今天的天氣很好。"
+        self.configure_translations(
+            openai=[None], openai_errors=["Translation service unavailable"],
+            tencent=["The weather is nice today."],
+        )
+        self.start_patch(
+            "src.uploads.speech_segments", return_value=[np.ones(800, dtype=np.float32)],
+        )
+        self.transcribe.return_value = source
+        self.correct.side_effect = lambda request: {
+            "corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": "The weather is lovely today.", "change_type": ["omission"],
+                "confidence": 0.95, "rationale": "Translate the missing English draft.",
+                "term_pairs": [],
+            } for row in request["segments"]],
+            "no_change": [],
+        }
+        downloads = self.capture_downloads()
+        self.select_wav()
+        self.transcribe_file()
+        result = self.wait_for_corrections()
+        self.assertEqual(result["statuses"], ["corrected"])
+        self.assertEqual(len(self.review_requests()), 1)
+        self.assertEqual(len(self.review_requests(conversation=True)), 1)
+        self.assertTrue(self.review_requests()[0]["segments"][0]["source_fallback"])
+        second_input = self.review_requests(conversation=True)[0]["segments"][0]
+        self.assertFalse(second_input["source_fallback"])
+        self.assertEqual(second_input["target_text"], "The weather is lovely today.")
+
+        for view in ("Live subtitles", "Final record"):
+            with self.subTest(view=view):
+                self.app.selectbox(key="subtitle_view").set_value(view).run()
+                self.assertEqual(len(self.app.exception), 0)
+                html = self.transcript_html()
+                self.assertEqual(html.count(source), 1)
+                self.assertIn("The weather is lovely today.", html)
+                self.assertIn("Corrected", html)
+                self.assertFalse(self.app.download_button(key="download_transcript").disabled)
+                report = next(value for value in reversed(downloads)
+                              if isinstance(value, str) and "English (Astra correction):" in value)
+                self.assertEqual(report.count(source), 1)
+                self.assertIn("English (OpenAI): [Translation unavailable]", report)
+                self.assertIn("English (Astra correction): The weather is lovely today.", report)
 
     def test_tencent_failure_and_retry_do_not_block_or_repeat_openai_translation(self):
         self.configure_translations(tencent=[None], tencent_errors=["Tencent translation unavailable"])
@@ -551,10 +811,14 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(self.app.session_state["upload_state"]["texts"], ["A short transcript"])
 
     def test_silent_wav_finishes_without_loading_asr(self):
-        self.start_patch("src.uploads.speech_segments", return_value=[])
+        decoded, views = self.track_upload_audio(silent=True)
         self.select_wav()
         self.transcribe_file()
 
+        gc.collect()
+        self.assertEqual(len(decoded), 1)
+        self.assertIsNone(decoded[0]())
+        self.assertEqual(views, [])
         state = self.app.session_state["upload_state"]
         self.assertTrue(state["finished"])
         self.assertEqual(state["texts"], [])
@@ -884,7 +1148,8 @@ class RecordingAppTests(unittest.TestCase):
 
         downloads = self.capture_downloads()
         disabled_during_job = {}
-        mapping_keys = {"eval_reference_sheet", "eval_header_row", "eval_text_column", "eval_display_column"}
+        mapping_keys = {"eval_reference_sheet", "eval_header_row", "eval_text_column", "eval_display_column",
+                        "microphone_translation_type"}
         for widget_name in ("selectbox", "number_input"):
             real_widget = getattr(st, widget_name)
 
@@ -1044,8 +1309,7 @@ class RecordingAppTests(unittest.TestCase):
 
     def test_correction_settings_are_frozen_per_session_and_pause_is_immediate(self):
         settings = {
-            "slow_window_n": 6, "slow_horizon": 10, "slow_seal_timeout": 25,
-            "slow_request_timeout": 5, "slow_max_tokens": 8192,
+            "slow_max_tokens": 8192,
         }
         for key, value in settings.items():
             self.app.number_input(key=key).set_value(value)
@@ -1057,8 +1321,6 @@ class RecordingAppTests(unittest.TestCase):
 
         self.assertEqual(lane.config.model, "gpt-6-astra")
         self.assertEqual(lane.config.reasoning_effort, "medium")
-        self.assertEqual((lane.config.window_n, lane.config.revision_horizon_s), (6, 10))
-        self.assertEqual((lane.config.seal_timeout_s, lane.config.request_timeout_s), (25, 5))
         self.assertEqual((lane.config.max_output_tokens, lane.config.confidence_threshold), (8192, 0.7))
         for key in settings:
             self.assertTrue(self.app.number_input(key=key).disabled)
@@ -1068,17 +1330,192 @@ class RecordingAppTests(unittest.TestCase):
         self.app.toggle(key="enable_corrections").set_value(False).run()
         self.assertEqual(lane.snapshot()["status"], "paused")
         self.app.button(key="stop_recording").click().run()
-        self.app.number_input(key="slow_window_n").set_value(2).run()
-        self.assertEqual(lane.config.window_n, 6)
+        self.app.number_input(key="slow_max_tokens").set_value(6144).run()
+        self.assertEqual(lane.config.max_output_tokens, 8192)
         self.start_recording()
         replacement = self.app.session_state["slow_lane"]
         self.assertIsNot(replacement, lane)
         self.assertEqual(lane.snapshot()["status"], "closed")
-        self.assertEqual(replacement.config.window_n, 2)
+        self.assertEqual(replacement.config.max_output_tokens, 6144)
         self.assertFalse(replacement.config.enabled)
         self.assertNotEqual(replacement.session_id, lane.session_id)
 
-    def test_fourth_lane_keeps_live_draft_when_late_correction_is_shown_in_final_view(self):
+    def test_correction_token_cap_defaults_to_combined_reasoning_and_output_budget(self):
+        control = self.app.number_input(key="slow_max_tokens")
+        self.assertEqual(control.value, 16384)
+        self.assertEqual(control.label, "Reasoning + output token cap")
+        self.assertIn("OPENAI_CORRECTION_MAX_OUTPUT_TOKENS", control.proto.help)
+        self.assertIn("reasoning", control.proto.help)
+        self.start_recording()
+        self.assertEqual(self.app.session_state["slow_lane"].config.max_output_tokens, 16384)
+
+    def test_correction_token_cap_uses_environment_for_a_fresh_session(self):
+        os.environ["OPENAI_CORRECTION_MAX_OUTPUT_TOKENS"] = "8192"
+        self.app = AppTest.from_file(str(APP_FILE)).run()
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertEqual(self.app.number_input(key="slow_max_tokens").value, 8192)
+        self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+        self.assertEqual(lane.config.max_output_tokens, 8192)
+        self.assertTrue(self.app.number_input(key="slow_max_tokens").disabled)
+        self.app.button(key="stop_recording").click().run()
+        self.app.number_input(key="slow_max_tokens").set_value(6144).run()
+        self.assertEqual(lane.config.max_output_tokens, 8192)
+        self.start_recording()
+        self.assertEqual(self.app.session_state["slow_lane"].config.max_output_tokens, 6144)
+
+    def test_correction_controls_have_no_deadlines_even_with_legacy_session_settings(self):
+        for key in ("slow_horizon", "slow_seal_timeout", "slow_request_timeout"):
+            self.app.session_state[key] = 1
+        self.app.run()
+        keys = {element.key for element in self.app.number_input}
+        self.assertFalse(keys & {"slow_horizon", "slow_seal_timeout", "slow_request_timeout"})
+        self.assertFalse(any("timeout" in element.label.casefold() for element in self.app.number_input))
+        self.start_recording()
+        config = self.app.session_state["slow_lane"].snapshot()["config"]
+        self.assertFalse(set(config) & {"revision_horizon_s", "seal_timeout_s", "request_timeout_s"})
+
+    def test_correction_has_no_batch_control_even_with_legacy_session_setting(self):
+        self.app.session_state["slow_window_n"] = 8
+        self.app.run()
+        self.assertNotIn("slow_window_n", {element.key for element in self.app.number_input})
+        self.assertFalse(any("Segments per review" in element.label for element in self.app.number_input))
+
+    def test_correction_model_and_reasoning_are_configurable_and_frozen_per_session(self):
+        os.environ["OPENAI_CORRECTION_MODEL"] = "configured-correction-model"
+        os.environ["OPENAI_CORRECTION_REASONING_EFFORT"] = " HIGH "
+        os.environ["OPENAI_FILTER_BACKGROUND_SPEECH"] = "false"
+        self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+
+        self.assertEqual(lane.config.model, "configured-correction-model")
+        self.assertEqual(lane.config.reasoning_effort, "high")
+        self.assertFalse(lane.config.filter_background_speech)
+        self.assertTrue(any("configured-correction-model · High reasoning" in caption.value
+                            for caption in self.app.caption))
+
+        os.environ["OPENAI_CORRECTION_MODEL"] = "next-correction-model"
+        os.environ["OPENAI_CORRECTION_REASONING_EFFORT"] = "max"
+        os.environ["OPENAI_FILTER_BACKGROUND_SPEECH"] = "true"
+        self.app.run()
+        self.assertEqual(lane.config.model, "configured-correction-model")
+        self.assertEqual(lane.config.reasoning_effort, "high")
+        self.assertFalse(lane.config.filter_background_speech)
+        self.assertTrue(any("Astra ·" in caption.value
+                            and "configured-correction-model · High reasoning" in caption.value
+                            for caption in self.app.caption))
+        self.app.button(key="stop_recording").click().run()
+        self.start_recording()
+        replacement = self.app.session_state["slow_lane"]
+        self.assertEqual(replacement.config.model, "next-correction-model")
+        self.assertEqual(replacement.config.reasoning_effort, "max")
+        self.assertTrue(replacement.config.filter_background_speech)
+
+    def test_fast_completion_dispatches_astra_without_a_ui_poll_and_keeps_its_original_lane(self):
+        self.configure_translations(openai=[None])
+        self.start_patch("src.uploads.speech_segments", return_value=[
+            {"audio": np.zeros(1600, dtype=np.float32), "start_s": 0.0, "end_s": 0.1},
+        ])
+        self.select_wav()
+        self.transcribe_file()
+        provider = self.translation_sessions["openai"]
+        original_lane = self.app.session_state["slow_lane"]
+        self.correct.assert_not_called()
+        self.assertIsNotNone(provider.on_result)
+        self.assertIsNone(self.translation_sessions["tencent"].on_result)
+        provider.translations[0] = "The fast English result."
+        failures = []
+
+        def notify():
+            try:
+                provider.on_result(provider.sources.copy(), provider.snapshot())
+            except Exception as exc:
+                failures.append(type(exc).__name__)
+
+        thread = Thread(target=notify, daemon=True)
+        thread.start()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        completed = self.wait_for_corrections()
+        self.assertEqual(completed["statuses"], ["confirmed"])
+        self.assertEqual(len(self.review_requests()), 1)
+        self.assertEqual(len(self.review_requests(conversation=True)), 1)
+        self.assertEqual(completed["conversation_review"]["reviewed"], 1)
+        self.assertEqual(completed["segments"][0]["timing"]["start_s"], 0.0)
+
+        self.select_wav(name="replacement.wav")
+        self.transcribe_file()
+        replacement = self.app.session_state["slow_lane"]
+        self.assertIsNot(replacement, original_lane)
+        provider.translations[0] = "A stale result from the previous conversation."
+        provider.on_result(provider.sources.copy(), provider.snapshot())
+        self.assertEqual(replacement.snapshot()["statuses"], ["waiting"])
+        self.assertEqual(len(self.review_requests()), 1)
+        self.assertEqual(len(self.review_requests(conversation=True)), 1)
+
+    def test_upload_publishes_each_parallel_correction_as_its_own_review_finishes(self):
+        first_entered, second_entered, release_first = Event(), Event(), Event()
+        self.addCleanup(release_first.set)
+
+        def correct(request):
+            self.assertEqual(len(request["segments"]), 1)
+            row = request["segments"][0]
+            first = row["source_text"] == "First transcript"
+            if first:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise RuntimeError("The first mocked review was not released.")
+            else:
+                second_entered.set()
+            return {"corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": "Reviewed first sentence." if first else "Reviewed second sentence.",
+                "change_type": ["style"], "confidence": 0.95,
+                "rationale": "Make the wording clear.", "term_pairs": [],
+            }], "no_change": []}
+
+        self.correct.side_effect = correct
+        self.transcribe.side_effect = ["First transcript", "Second transcript"]
+        self.start_patch("src.uploads.speech_segments", return_value=[
+            {"audio": np.zeros(1600, dtype=np.float32), "start_s": 0.0, "end_s": 0.1},
+            {"audio": np.zeros(1600, dtype=np.float32), "start_s": 0.2, "end_s": 0.3},
+        ])
+        self.app.session_state["slow_window_n"] = 8
+        self.select_wav()
+        self.transcribe_file()
+        self.assertTrue(first_entered.wait(1))
+        self.assertTrue(second_entered.wait(1), "The second review waited for the first review to finish.")
+        deadline = monotonic() + 2
+        while monotonic() < deadline:
+            snapshot = self.app.session_state["slow_lane"].snapshot()
+            if snapshot["segments"][1]["status"] == "corrected":
+                break
+            sleep(0.005)
+        self.assertEqual(snapshot["statuses"], ["draft", "corrected"])
+        self.assertEqual(snapshot["first_pass"]["pending"], 1)
+        self.assertEqual(snapshot["conversation_review"]["pending"], 1)
+        self.assertEqual(snapshot["pending"], 2)
+        self.assertEqual(snapshot["active_reviews"], 1)
+        self.assertEqual(self.review_requests(conversation=True), [])
+        self.app.run()
+        self.assertIn("Reviewed second sentence.", self.transcript_html())
+        self.assertIn("Corrected", self.transcript_html())
+        self.assertNotIn("Reviewed first sentence.", self.transcript_html())
+        self.assertIn("Astra · 1 segment(s) under review", self.rendered_text())
+        self.assertIn("1 awaiting review", self.rendered_text())
+        self.assertIn("Conversation review 0/2", self.rendered_text())
+        release_first.set()
+        final = self.wait_for_corrections()
+        self.assertEqual(final["statuses"], ["corrected", "corrected"])
+        self.assertEqual(final["translations"], ["Reviewed first sentence.", "Reviewed second sentence."])
+        self.assertEqual(len(self.review_requests()), 2)
+        self.assertEqual([request["segments"][0]["source_text"]
+                          for request in self.review_requests(conversation=True)],
+                         ["First transcript", "Second transcript"])
+        self.assertEqual(final["conversation_review"]["reviewed"], 2)
+
+    def test_fourth_lane_replaces_live_draft_when_late_correction_finishes(self):
         entered, release = Event(), Event()
         self.addCleanup(release.set)
 
@@ -1094,7 +1531,6 @@ class RecordingAppTests(unittest.TestCase):
             }], "no_change": []}
 
         self.correct.side_effect = correct
-        self.app.number_input(key="slow_horizon").set_value(0).run()
         self.start_patch("src.uploads.speech_segments", return_value=[{
             "audio": np.zeros(1600, dtype=np.float32), "start_s": 0.0, "end_s": 0.1,
         }])
@@ -1107,58 +1543,74 @@ class RecordingAppTests(unittest.TestCase):
         self.app.selectbox(key="subtitle_view").select("Final record").run()
         self.assertIn("Awaiting final text…", self.transcript_html())
         self.assertNotIn("The reviewed English sentence.", self.transcript_html())
+        self.app.selectbox(key="subtitle_view").select("Live subtitles").run()
 
         release.set()
         final = self.wait_for_corrections()
         self.app.run()
         self.assertEqual(len(self.app.exception), 0)
         self.assertEqual(final["authoritative"], ["The reviewed English sentence."])
-        self.assertEqual(final["translations"], ["English segment 1."])
-        self.assertIn("Corrected · Final", self.transcript_html())
+        self.assertEqual(final["translations"], ["The reviewed English sentence."])
+        self.assertIn(">Corrected</span>", self.transcript_html())
+        self.assertIn('class="translation-cell astra-cell astra-corrected"', self.transcript_html())
         self.assertIn("The reviewed English sentence.", self.transcript_html())
         self.assertFalse(self.app.download_button(key="download_final_srt").disabled)
-        self.app.selectbox(key="subtitle_view").select("Live subtitles").run()
-        self.assertIn("Draft · Final correction available", self.transcript_html())
-        self.assertNotIn("The reviewed English sentence.", self.transcript_html())
+        self.app.selectbox(key="subtitle_view").select("Final record").run()
+        self.assertIn("Corrected · Final", self.transcript_html())
+        self.assertIn("The reviewed English sentence.", self.transcript_html())
         self.assertIn("A short transcript", self.transcript_html())
         self.assertIn("Tencent segment 1.", self.transcript_html())
         self.assertEqual(self.transcribe.call_count, 1)
-        self.assertEqual(self.correct.call_count, 1)
+        self.assertEqual(len(self.review_requests()), 1)
+        self.assertEqual(len(self.review_requests(conversation=True)), 1)
+        self.assertEqual(final["conversation_review"]["reviewed"], 1)
 
     def test_completed_fast_draft_is_rendered_and_reviewed_while_next_asr_is_blocked(self):
         from src.ui import render_transcript
 
         second_started, release, rendered_while_blocked = Event(), Event(), Event()
         interrupted = False
+        calls = 0
+        pending_task_id = None
         self.addCleanup(release.set)
         self.configure_translations(openai=[None, None])
-        self.start_patch("src.uploads.speech_segments", return_value=[
-            np.ones(800, dtype=np.float32), np.zeros(800, dtype=np.float32),
-        ])
+        decoded, views = self.track_upload_audio()
 
         def transcribe(audio):
-            if self.transcribe.call_count == 1:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
                 return "First original."
             second_started.set()
             self.translation_sessions["openai"].translations[0] = "Fast English arrived."
             if not release.wait(5):
                 raise RuntimeError("The UI did not publish fast output during blocked ASR.")
+            np.testing.assert_array_equal(audio, np.zeros(800, dtype=np.float32))
             return "Second original."
 
         def observe_render(texts, *args, **kwargs):
-            nonlocal interrupted
+            nonlocal interrupted, pending_task_id
             if second_started.is_set() and not interrupted:
                 interrupted = True
+                job = st.session_state.upload_job
+                pending_task_id = id(job["asr_task"])
+                self.assertFalse(job["asr_task"].done())
+                self.assertIs(job["audio"], decoded[0]())
                 st.rerun()
             slow = kwargs.get("slow_lane", {})
             if (second_started.is_set() and not release.is_set() and texts == ["First original."]
                     and args[0][0] == "Fast English arrived."
                     and slow.get("translations") == ["Fast English arrived."] and self.correct.call_count):
+                job = st.session_state.upload_job
+                self.assertEqual(id(job["asr_task"]), pending_task_id)
+                self.assertEqual(job["next_segment"], 1)
+                self.assertIsNotNone(decoded[0]())
+                self.assertTrue(np.shares_memory(views[1](), decoded[0]()))
                 rendered_while_blocked.set()
                 release.set()
             return render_transcript(texts, *args, **kwargs)
 
-        self.transcribe.side_effect = transcribe
+        self.load_transcriber.return_value = transcribe
         self.start_patch("src.ui.render_transcript", side_effect=observe_render)
         self.select_wav()
         self.app.button(key="transcribe_file").click().run(timeout=8)
@@ -1169,8 +1621,11 @@ class RecordingAppTests(unittest.TestCase):
         state = self.app.session_state["upload_state"]
         self.assertIsNone(state["error"])
         self.assertEqual(state["texts"], ["First original.", "Second original."])
-        self.assertEqual(self.transcribe.call_count, 2)
+        self.assertEqual(calls, 2)
         self.assertIn("Fast English arrived.", self.transcript_html())
+        gc.collect()
+        self.assertEqual(len(decoded), 1)
+        self.assertTrue(all(reference() is None for reference in decoded + views))
 
     def test_speaker_offsets_reach_corrections_and_references_stay_out_of_model_inputs(self):
         source_reference, english_reference = "來源參考秘密", "PRIVATE ENGLISH REFERENCE"
@@ -1228,6 +1683,76 @@ class RecordingAppTests(unittest.TestCase):
         self.assertNotIn("模型輸出一", reference_pane)
         self.assertEqual(set(self.evaluation_scores()), {"Breeze · Mixed match"})
 
+    def test_conversation_review_failure_keeps_first_english_and_retries_only_the_second_pass(self):
+        fail_second = Event()
+        fail_second.set()
+        exported = []
+        real_download = st.download_button
+
+        def capture_download(*args, **kwargs):
+            if kwargs.get("key") == "download_session":
+                data = kwargs["data"] if "data" in kwargs else args[1]
+                exported.append(json.loads(data))
+            return real_download(*args, **kwargs)
+
+        def correct(request):
+            row = request["segments"][0]
+            first = row["source_text"] == "Original first."
+            second_pass = request.get("review_stage") == "conversation"
+            if second_pass and first and fail_second.is_set():
+                raise RuntimeError("PRIVATE SECOND PASS ERROR")
+            prefix = "Conversation" if second_pass else "First accepted"
+            target = f"{prefix} {'first' if first else 'second'} sentence."
+            return {"corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": target, "change_type": ["style"], "confidence": 0.95,
+                "rationale": "Clarify the sentence.", "term_pairs": [],
+            }], "no_change": []}
+
+        self.correct.side_effect = correct
+        self.start_patch("streamlit.download_button", side_effect=capture_download)
+        self.start_patch("src.uploads.speech_segments", return_value=[
+            {"audio": np.zeros(800, dtype=np.float32), "start_s": 0.0, "end_s": 0.05},
+            {"audio": np.zeros(800, dtype=np.float32), "start_s": 0.05, "end_s": 0.1},
+        ])
+        self.transcribe.side_effect = ["Original first.", "Original second."]
+        self.select_wav()
+        self.transcribe_file()
+        deadline = monotonic() + 3
+        while monotonic() < deadline:
+            failed = self.app.session_state["slow_lane"].snapshot()
+            if (failed["status"] == "degraded" and len(failed["segments"]) == 2
+                    and failed["segments"][1]["first_pass_status"] == "corrected"):
+                break
+            sleep(0.005)
+        self.assertEqual(failed["authoritative"], [
+            "First accepted first sentence.", "First accepted second sentence.",
+        ])
+        self.assertEqual(failed["segments"][0]["conversation_review_status"], "failed")
+        self.assertEqual(failed["segments"][1]["first_pass_status"], "corrected")
+        self.app.run()
+        self.assertIn("First accepted second sentence.", self.transcript_html())
+        self.assertIn("astra-corrected", self.transcript_html())
+        self.assertIn("Conversation review 0/2", self.rendered_text())
+        self.assertTrue(any("Conversation review:" in warning.value for warning in self.app.warning))
+        self.assertNotIn("PRIVATE SECOND PASS ERROR", json.dumps(exported[-1]))
+        self.assertEqual(exported[-1]["first_pass"]["authoritative"], failed["authoritative"])
+
+        fail_second.clear()
+        self.app.button(key="retry_corrections").click().run()
+        reviewed = self.wait_for_corrections()
+        self.app.run()
+        self.assertEqual(reviewed["authoritative"], [
+            "Conversation first sentence.", "Conversation second sentence.",
+        ])
+        self.assertEqual(reviewed["first_pass"]["authoritative"], failed["authoritative"])
+        self.assertEqual(reviewed["conversation_review"]["reviewed"], 2)
+        self.assertEqual(exported[-1]["authoritative"], reviewed["authoritative"])
+        self.assertEqual(exported[-1]["translation_config"]["type"], "Compare all translations")
+        first_calls = [call for call in self.correct.call_args_list
+                       if call.args[0].get("review_stage") != "conversation"]
+        self.assertEqual(len(first_calls), 2)
+
     def test_correction_and_speaker_failures_preserve_fast_results_and_allow_correction_retry(self):
         confirm = self.correct.side_effect
         self.correct.side_effect = RuntimeError("PRIVATE API ERROR")
@@ -1243,7 +1768,7 @@ class RecordingAppTests(unittest.TestCase):
 
         self.assertEqual(len(self.app.exception), 0)
         self.assertEqual(degraded["status"], "degraded")
-        self.assertIn("Corrections unavailable", self.rendered_text())
+        self.assertIn("Some reviews need retry", self.rendered_text())
         self.assertIn("Speaker detection failed", self.rendered_text())
         self.assertIn("Speaker unknown", self.transcript_html())
         self.assertIn("A short transcript", self.transcript_html())
@@ -1258,7 +1783,9 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(recovered["authoritative"], ["English segment 1."])
         self.assertIn(">Confirmed</span>", self.transcript_html())
         self.assertEqual(self.transcribe.call_count, 1)
-        self.assertEqual(self.correct.call_count, 2)
+        self.assertEqual(len(self.review_requests()), 2)
+        self.assertEqual(len(self.review_requests(conversation=True)), 1)
+        self.assertEqual(recovered["conversation_review"]["reviewed"], 1)
 
 
 if __name__ == "__main__":

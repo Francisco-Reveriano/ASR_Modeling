@@ -67,6 +67,38 @@ class GlossaryTests(unittest.TestCase):
         self.assertFalse(changed["ok"])
         self.assertFalse(compare_dnt("EXP-07", "exp-07")["ok"])
 
+    def test_cjk_dnt_terms_and_aliases_fail_with_safe_english_configuration_error(self):
+        entries = [
+            {"term_src": "PRIVATE布拉吉", "dnt": True},
+            {"term_src": "PRIVATE布拉吉", "term_tgt": "Bragi", "dnt": True},
+            {"term_src": "Bragi", "dnt": True, "aliases_src": "BRAGI|PRIVATE布拉吉"},
+            {"term_src": "Bragi", "dnt": True, "aliases_src": ["PRIVATE布拉吉"]},
+        ]
+        for entry in entries:
+            with self.subTest(entry=entry):
+                with self.assertRaises(ValueError) as raised:
+                    Glossary([entry])
+                message = str(raised.exception)
+                self.assertIn("English output", message)
+                self.assertIn("DNT terms and aliases", message)
+                self.assertIn("Latin", message)
+                self.assertNotIn("PRIVATE", message)
+                self.assertNotIn("布拉吉", message)
+
+    def test_chinese_glossary_mappings_and_latin_dnt_remain_compatible_with_english(self):
+        glossary = Glossary([
+            {"term_src": "布拉吉", "term_tgt": "Bragi", "aliases_src": ["布拉基"]},
+            {"term_src": "ETCH-07", "dnt": True, "aliases_src": ["ETCH-08"]},
+            {"term_src": "José", "dnt": True},
+        ])
+        source = "José 用 ETCH-07 和 ETCH-08 處理布拉基"
+        translated = "José processes Bragi with ETCH-07 and ETCH-08."
+
+        self.assertEqual(glossary.retrieve("布拉基")[0]["term_tgt"], "Bragi")
+        self.assertEqual(glossary.dnt_hits(source), ["José", "ETCH-07", "ETCH-08"])
+        self.assertTrue(glossary.compare_dnt(source, translated)["ok"])
+        self.assertFalse(glossary.compare_dnt(source, translated.replace("ETCH-07", "etch-07"))["ok"])
+
     def test_learning_requires_two_distinct_segments_and_keeps_evidence(self):
         glossary = Glossary()
         self.assertFalse(glossary.observe("新製程", "new process", "segment-1"))
@@ -216,6 +248,16 @@ class GlossaryLoadingTests(unittest.TestCase):
                 glossary = load_glossary(dnt_path=self.write(name, content))
                 self.assertEqual(glossary.dnt_hits("Teams ETCH-07"), ["Teams", "ETCH-07"])
                 self.assertTrue(all(entry["dnt"] for entry in glossary.entries))
+
+    def test_loading_cjk_dnt_file_rejects_configuration_without_modifying_it(self):
+        path = self.write("dnt.txt", "Teams\nPRIVATE布拉吉\n")
+        original = path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "English output") as raised:
+            load_glossary(dnt_path=path)
+
+        self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn("PRIVATE", str(raised.exception))
 
     def test_xlsx_loads_values_and_rejects_formula_cells(self):
         workbook = Workbook()

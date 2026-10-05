@@ -1,12 +1,15 @@
 """Check uploaded audio preparation without loading either speech model."""
 
 from io import BytesIO
+from math import gcd
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import weakref
 
 import numpy as np
 import soundfile as sf
+from scipy.signal import resample_poly
 
 from src.uploads import MAX_SEGMENT_SECONDS, SAMPLE_RATE, decode_wav, speech_segments
 
@@ -81,6 +84,88 @@ class DecodeWavTests(unittest.TestCase):
                 data = audio_bytes(np.array([0.0, invalid, 0.0], dtype=np.float32))
                 with self.assertRaisesRegex(ValueError, "nonfinite"):
                     decode_wav(data)
+
+    def test_blocked_decode_matches_full_decode_across_formats_and_boundaries(self):
+        rng = np.random.default_rng(761)
+        cases = (
+            ("WAV", "PCM_U8", 1, SAMPLE_RATE),
+            ("WAV", "PCM_16", 2, 48000),
+            ("WAV", "PCM_24", 6, 44100),
+            ("WAVEX", "PCM_32", 2, 8000),
+            ("WAVEX", "FLOAT", 4, 22050),
+            ("RF64", "DOUBLE", 1, SAMPLE_RATE),
+        )
+        for format, subtype, channels, sample_rate in cases:
+            for frames in (65_535, 65_536, 65_537, 131_079):
+                with self.subTest(format=format, subtype=subtype, channels=channels,
+                                  sample_rate=sample_rate, frames=frames):
+                    samples = rng.uniform(-0.9, 0.9, size=(frames, channels))
+                    data = audio_bytes(samples, sample_rate, format=format, subtype=subtype)
+                    # Preserve the original full-array decode as the sample-level oracle.
+                    with sf.SoundFile(BytesIO(data)) as source:
+                        expected = source.read(dtype="float32", always_2d=True).mean(axis=1)
+                    if sample_rate != SAMPLE_RATE:
+                        divisor = gcd(sample_rate, SAMPLE_RATE)
+                        expected = resample_poly(
+                            expected, SAMPLE_RATE // divisor, sample_rate // divisor,
+                        )
+
+                    audio = decode_wav(data)
+
+                    np.testing.assert_array_equal(audio, expected)
+                    self.assertEqual(audio.dtype, np.float32)
+                    self.assertTrue(audio.flags.c_contiguous)
+
+    def test_reads_are_bounded_and_blocks_are_released_before_resampling(self):
+        data = audio_bytes(np.zeros((131_079, 2)), sample_rate=48000, subtype="PCM_16")
+        block_refs = []
+        with sf.SoundFile(BytesIO(data)) as source:
+            original_read = source.read
+
+            def read_block(**kwargs):
+                self.assertLessEqual(kwargs["frames"], 65_536)
+                self.assertTrue(all(ref() is None for ref in block_refs))
+                block = original_read(**kwargs)
+                block_refs.append(weakref.ref(block))
+                return block
+
+            def resample(audio, up, down):
+                self.assertTrue(all(ref() is None for ref in block_refs))
+                return resample_poly(audio, up, down)
+
+            with patch("src.uploads.sf.SoundFile", return_value=source), \
+                    patch.object(source, "read", side_effect=read_block) as read, \
+                    patch("src.uploads.resample_poly", side_effect=resample) as resampler:
+                audio = decode_wav(data)
+
+        self.assertEqual([call.kwargs["frames"] for call in read.call_args_list], [65_536, 65_536, 7])
+        resampler.assert_called_once()
+        self.assertEqual(audio.shape, (43_693,))
+
+    def test_short_reads_use_actual_frame_counts_and_trim_unread_capacity(self):
+        chunks = [np.full((17, 2), 0.25, dtype=np.float32),
+                  np.full((31, 2), 0.75, dtype=np.float32),
+                  np.empty((0, 2), dtype=np.float32)]
+        with patch("src.uploads.sf.SoundFile") as open_sound:
+            source = open_sound.return_value.__enter__.return_value
+            source.format = "WAV"
+            source.samplerate = SAMPLE_RATE
+            source.frames = 131_072
+            source.read.side_effect = chunks
+
+            audio = decode_wav(b"fake wav")
+
+        expected = np.concatenate([chunk.mean(axis=1) for chunk in chunks[:2]])
+        np.testing.assert_array_equal(audio, expected)
+        self.assertEqual(audio.nbytes, 48 * np.dtype(np.float32).itemsize)
+        self.assertTrue(audio.flags.owndata)
+
+    def test_nonfinite_audio_after_a_block_boundary_is_rejected(self):
+        samples = np.zeros((65_537, 2), dtype=np.float32)
+        samples[-1, 1] = np.inf
+
+        with self.assertRaisesRegex(ValueError, "nonfinite"):
+            decode_wav(audio_bytes(samples))
 
 
 class SpeechSegmentsTests(unittest.TestCase):

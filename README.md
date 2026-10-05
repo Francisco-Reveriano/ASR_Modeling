@@ -10,6 +10,51 @@ The previous OpenAI, Tencent, speaker detection, and two-pass correction tool is
 preserved on the `OpenAI-Translation-Updates` branch. Those workers and large
 local models are absent from this branch's runtime.
 
+## End-to-end structure
+
+Solid arrows show the current runtime. The dotted arrows and the **Deferred**
+group show speaker diarization, which this branch does not install or run.
+
+```mermaid
+flowchart TD
+    mic["Browser microphone"] --> resample["Local mono 16 kHz resampling"]
+    wav["Uploaded WAV"] --> resample
+    resample --> vad["Local Silero VAD<br/>bounded speech segmentation"]
+    vad -->|"one mono 16 kHz WAV segment per request"| asr["Hosted vLLM ASR<br/>POST /v1/audio/transcriptions"]
+    asr -->|"original-language transcript"| worker["Ordered translation worker"]
+    worker --> translator["Hosted vLLM translator<br/>POST /v1/chat/completions"]
+    translator --> validate["English and protected-identifier validation"]
+    validate -->|"at most one repair request"| translator
+    validate -->|"validated complete English"| rows["UI source and English rows"]
+    rows --> exports["TXT / JSON / CSV / SRT / VTT exports"]
+    ref["Optional local source reference"] --> evaluation["Local ASR evaluation"]
+    asr -->|"joined original-language transcript"| evaluation
+
+    subgraph deferred["Deferred: not installed, configured, or run on this branch"]
+        diarization["nvidia/Nemotron-3-Diarization"]
+    end
+    resample -.->|"continuous mono 16 kHz audio"| diarization
+    diarization -.->|"anonymous Speaker N labels"| rows
+```
+
+Only Silero VAD runs in the app process. Speech segments go to the configured
+ASR instance; completed transcripts go to the selected translator. Source
+references stay local and are used only for evaluation.
+
+### Speaker diarization model
+
+The previous local speaker detection used
+[`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization)
+at pinned revision `f667ed73aee57d40cc39428eb768b4fd87a0a29e`, added in commit
+[`42f2c71`](https://github.com/Francisco-Reveriano/ASR_Modeling/commit/42f2c714606d123ed902c0157a4d110be5e756ca).
+It ran locally on CPU, streamed continuous audio (including silence)
+independently from ASR, and produced anonymous labels such as `Speaker 1` that
+were matched to transcript rows by audio-time overlap.
+
+The current `vLLM-Hosting` runtime does not install, configure, or execute this
+model, and transcript rows have no speaker labels. Speaker diarization remains
+deferred.
+
 ## Linux setup
 
 Create a Python environment on the Linux machine. Python 3.11 or newer is

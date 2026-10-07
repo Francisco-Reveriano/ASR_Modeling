@@ -3,6 +3,7 @@
 from collections import deque
 from pathlib import Path
 from threading import Condition, Lock, Thread
+from time import monotonic
 
 import numpy as np
 import torch
@@ -56,6 +57,10 @@ class NemotronDiarizer:
         self._first = True
         self._finished = False
         self._speaker_cache = None
+
+    @property
+    def processed_seconds(self):
+        return min(self._total_samples, self._frames * self._processor.feature_extractor.hop_length) / SAMPLE_RATE
 
     def __call__(self, samples, *, final=False):
         if self._finished:
@@ -131,6 +136,9 @@ class DiarizationSession:
         self._condition = Condition(self._lock)
         self._queue = deque()
         self._queued_samples = 0
+        self._received_samples = 0
+        self._processed_samples = 0
+        self._processed_seconds = 0.0
         self._segments = []
         self._last_by_speaker = {}
         self._status = "idle" if enabled else "disabled"
@@ -164,10 +172,11 @@ class DiarizationSession:
                 return
             self._queue.append(audio)
             self._queued_samples += len(audio)
+            self._received_samples += len(audio)
             self._has_audio = True
             self._status = "active"
             self._start_worker()
-            self._condition.notify()
+            self._condition.notify_all()
 
     def finish(self):
         with self._lock:
@@ -178,17 +187,19 @@ class DiarizationSession:
                 self._status = "complete"
             else:
                 self._start_worker()
-            self._condition.notify()
+            self._condition.notify_all()
 
     def close(self):
         with self._lock:
             self._closed = True
             self._queue.clear()
             self._queued_samples = 0
+            self._received_samples = self._processed_samples = 0
+            self._processed_seconds = 0.0
             self._segments.clear()
             self._last_by_speaker.clear()
             self._status, self._error = "disabled", None
-            self._condition.notify()
+            self._condition.notify_all()
 
     def snapshot(self):
         with self._lock:
@@ -197,7 +208,21 @@ class DiarizationSession:
             )
             return {"status": self._status,
                     "segments": [dict(item) for item in sorted(self._segments, key=lambda row: (row["start_s"], row["speaker_id"]))],
-                    "error": self._error, "pending": pending}
+                    "error": self._error, "pending": pending,
+                    "processed_seconds": self._processed_seconds,
+                    "received_seconds": self._received_samples / SAMPLE_RATE}
+
+    def wait_for_audio(self, end_s, timeout=3):
+        """Wait off the UI/capture thread for scored audio, with a bounded fallback."""
+        deadline = monotonic() + timeout
+        with self._condition:
+            while (self._status == "active" and not self._closed and
+                   self._processed_seconds + 1e-6 < end_s):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return self._status == "complete" or self._processed_seconds + 1e-6 >= end_s
 
     def labels(self, timings):
         return speaker_labels(timings, self.snapshot()["segments"])
@@ -212,7 +237,7 @@ class DiarizationSession:
         self._status, self._error = "failed", message
         self._queue.clear()
         self._queued_samples = 0
-        self._condition.notify()
+        self._condition.notify_all()
 
     def _publish(self, segments):
         for item in segments or []:
@@ -244,6 +269,7 @@ class DiarizationSession:
                     else:
                         if self._ending:
                             self._status = "complete"
+                        self._condition.notify_all()
                         self._worker = None
                         return
                     self._working = True
@@ -269,6 +295,11 @@ class DiarizationSession:
                         self._publish(segments)
                         if part is not None:
                             self._queued_samples -= len(part)
+                            self._processed_samples += len(part)
+                        scored = getattr(self._diarize, "processed_seconds", None)
+                        self._processed_seconds = (float(scored) if isinstance(scored, (int, float)) else
+                                                   self._processed_samples / SAMPLE_RATE)
+                        self._condition.notify_all()
                 with self._lock:
                     self._working = False
         except Exception:
@@ -306,3 +337,65 @@ def speaker_labels(timings, segments):
         else:
             labels.append(None)
     return labels
+
+
+def split_speaker_turns(audio, timing, segments, *, min_turn_seconds=0.35):
+    """Cut substantial sequential speaker changes without dropping/repeating PCM.
+
+    Stable single-speaker spans anchor the cuts; brief activity flicker is ignored.
+    Cuts fall between anchors, usually in a pause. Substantial simultaneous speech
+    stays mixed: diarization cannot separate overlapping voices from mono audio.
+    """
+    timing = timing or {}
+    start = timing.get("start_s")
+    if start is None or "end_s" not in timing or not len(audio):
+        return [{"audio": audio, **timing}]
+    end = start + len(audio) / SAMPLE_RATE
+    intervals = [(max(start, s["start_s"]), min(end, s["end_s"]), s["speaker_id"])
+                 for s in segments if s["end_s"] > start and s["start_s"] < end]
+    points = sorted({start, end} | {p for a, b, _ in intervals for p in (a, b)})
+    stable, overlaps = [], []
+    for left, right in zip(points, points[1:]):
+        active = {speaker for a, b, speaker in intervals if a < right and b > left}
+        if len(active) > 1:
+            overlaps.append((left, right))
+        elif len(active) == 1:
+            speaker = next(iter(active))
+            if stable and stable[-1][2] == speaker and left - stable[-1][1] <= 0.2:
+                stable[-1] = (stable[-1][0], right, speaker)
+            else:
+                stable.append((left, right, speaker))
+    anchors = [span for span in stable if span[1] - span[0] >= min_turn_seconds]
+    cuts, previous = [0], None
+    for anchor in anchors:
+        if previous is not None and previous[2] != anchor[2]:
+            overlap = sum(max(0, min(anchor[0], b) - max(previous[1], a)) for a, b in overlaps)
+            if overlap < 0.25:
+                cut = round(((previous[1] + anchor[0]) / 2 - start) * SAMPLE_RATE)
+                if cut - cuts[-1] >= min_turn_seconds * SAMPLE_RATE and len(audio) - cut >= min_turn_seconds * SAMPLE_RATE:
+                    cuts.append(cut)
+        previous = anchor
+    cuts.append(len(audio))
+    parts = []
+    for left, right in zip(cuts, cuts[1:]):
+        part = dict(timing, start_s=start + left / SAMPLE_RATE, end_s=start + right / SAMPLE_RATE)
+        speaker = speaker_labels([part], segments)[0]
+        if speaker:
+            part["speaker_id"] = speaker
+        parts.append(dict(part, audio=audio if len(cuts) == 2 else audio[left:right]))
+    return parts
+
+
+def prepare_speaker_turns(audio, timing, diarization, *, timeout=3):
+    """Wait only on the ASR worker, then use complete speaker timing if available."""
+    timing = timing or {}
+    if diarization is None or "end_s" not in timing:
+        return [{"audio": audio, **timing}]
+    state = diarization.snapshot()
+    if not isinstance(state, dict) or state.get("status") in {"disabled", "failed", "idle"}:
+        return [{"audio": audio, **timing}]
+    if state.get("status") == "active" and state.get("processed_seconds", 0) < timing["end_s"]:
+        if not diarization.wait_for_audio(timing["end_s"], timeout=timeout):
+            return [{"audio": audio, **timing}]
+        state = diarization.snapshot()
+    return split_speaker_turns(audio, timing, state.get("segments", []))

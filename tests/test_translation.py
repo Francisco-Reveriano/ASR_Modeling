@@ -39,6 +39,40 @@ class SessionTestCase(unittest.TestCase):
 
 
 class TranslationSessionTests(SessionTestCase):
+    def test_cancellable_local_provider_releases_worker_and_ignores_late_result(self):
+        entered, stopped = Event(), Event()
+        calls = []
+
+        def translate(text, *, cancel_event):
+            calls.append(text)
+            entered.set()
+            if cancel_event.wait(2):
+                stopped.set()
+            return "Late result."
+
+        observer = Mock()
+        session = self.make_session(translate, cancellable=True, on_result=observer)
+        session.submit(["first", "second"])
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(session.progress()["active_rows"], [1])
+        self.assertEqual(session.progress()["queued"], 1)
+        session.close()
+        self.assertTrue(stopped.wait(1))
+        self.join_worker(session)
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(session.snapshot()["translations"], [None, None])
+        self.assertEqual(session.progress()["active_rows"], [])
+        observer.assert_not_called()
+
+    def test_selected_model_keeps_context_and_reaches_translation_request(self):
+        with patch("src.translation.translate_to_english", return_value="Hello") as translate:
+            session = self.make_session(model="gpt-6-luna")
+            session.submit(["你好"])
+            self.join_worker(session)
+            self.assertEqual(translate.call_args.kwargs["model"], "gpt-6-luna")
+            self.assertEqual(translate.call_args.kwargs["context"]["target_lang"], "en")
+            self.assertEqual(session.snapshot()["translations"], ["Hello"])
+
     def test_completion_observer_runs_without_polling_or_holding_translation_lock(self):
         observed = []
         completed = Event()
@@ -604,6 +638,14 @@ class OpenAITranslationTests(SessionTestCase):
         self.assertEqual(settings["model"], "configured-model")
         self.assertNotIn("reasoning", settings)
         self.assertNotIn("tools", settings)
+
+    def test_selected_luna_pair_takes_precedence_over_legacy_environment_model(self):
+        os.environ["OPENAI_DEFAULT_MODEL"] = "configured-model"
+        translate_to_english("source text", model="gpt-6-luna")
+        settings = self.client.responses.create.call_args.kwargs
+        self.assertEqual(settings["model"], "gpt-6-luna")
+        self.assertEqual(settings["reasoning"], {"effort": "none"})
+        self.assertIs(settings["store"], False)
 
     def test_configured_reasoning_is_sent_for_default_and_custom_models(self):
         for model in (DEFAULT_MODEL, "configured-model"):

@@ -21,6 +21,37 @@ class TokenBatch(dict):
 
 
 class TencentTranslationTests(unittest.TestCase):
+    def test_cancel_before_loading_never_loads_local_weights(self):
+        cancelled = Event()
+        cancelled.set()
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            tencent.translate_with_tencent("你好", cancel_event=cancelled)
+        self.load_model.assert_not_called()
+
+    def test_generation_observes_cancellation_and_discards_its_output(self):
+        cancelled = Event()
+
+        def generate(**kwargs):
+            stop = kwargs["stopping_criteria"][0]
+            self.assertFalse(stop(None, None))
+            cancelled.set()
+            self.assertTrue(stop(None, None))
+            return torch.tensor([[1, 2, 3, 7, 8, 9]])
+
+        self.model.generate.side_effect = generate
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            tencent.translate_with_tencent("你好", cancel_event=cancelled)
+        self.tokenizer.decode.assert_not_called()
+
+    def test_loading_failure_has_safe_readiness_status_and_can_retry(self):
+        self.load_model.side_effect = RuntimeError("private path")
+        with self.assertRaises(RuntimeError):
+            tencent.translate_with_tencent("你好")
+        self.assertEqual(tencent.local_model_status(), "model loading failed")
+        self.load_model.side_effect = None
+        tencent.translate_with_tencent("你好")
+        self.assertEqual(tencent.local_model_status(), "ready on CPU")
+
     def setUp(self):
         directory = self.enterContext(TemporaryDirectory())
         self.model_dir = Path(directory)
@@ -106,6 +137,7 @@ class TencentTranslationTests(unittest.TestCase):
         self.assertEqual({key: value for key, value in settings.items() if key not in self.batch}, {
             "max_new_tokens": 512, "do_sample": True, "temperature": 0.7,
             "top_p": 0.6, "top_k": 20, "repetition_penalty": 1.05,
+            "max_time": tencent.MAX_GENERATION_SECONDS,
         })
         tokens = self.tokenizer.decode.call_args.args[0]
         torch.testing.assert_close(tokens, torch.tensor([7, 8, 9]))

@@ -12,9 +12,26 @@ from scipy.signal import resample_poly
 import torch
 
 from src.pipeline import SAMPLE_RATE, SPEECH_PAD_MS
+from src.diarization import prepare_speaker_turns
 
 MAX_SEGMENT_SECONDS = 15
 WAV_BLOCK_FRAMES = 65_536
+
+
+def prepare_speaker_turns_in_background(segment, diarization):
+    """Keep local speaker warmup/alignment off Streamlit's rendering thread."""
+    future = Future()
+
+    def run():
+        try:
+            timing = {key: value for key, value in segment.items() if key != "audio"}
+            parts = prepare_speaker_turns(segment["audio"], timing, diarization, timeout=30)
+            future.set_result(parts)
+        except Exception:
+            # Speaker processing must never prevent transcription of the audio.
+            future.set_result([segment])
+    Thread(target=run, daemon=True, name="upload-speaker-turns").start()
+    return future
 
 
 def transcribe_in_background(transcribe, audio):

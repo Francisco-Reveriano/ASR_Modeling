@@ -39,6 +39,7 @@ import numpy as np
 import torch
 
 from src.model_lock import LOCAL_MODEL_LOCK
+from src.diarization import prepare_speaker_turns
 
 SAMPLE_RATE = 16_000  # Both models receive 16,000 audio samples per second.
 FRAME_SIZE = 512  # One Silero inference window: 32 ms at this sample rate.
@@ -197,7 +198,7 @@ class LiveTranscriber:
         # Count both queued and in-progress segments for the UI's status.
         self._pending = 0
         self._error = None
-        self._worker = Thread(target=self._run, daemon=True, name="breeze-transcription")
+        self._worker = Thread(target=self._run, daemon=True, name="speech-transcription")
 
     def push(self, frame):
         """Accept a PyAV AudioFrame and return the original frame to WebRTC.
@@ -207,7 +208,7 @@ class LiveTranscriber:
         at 16 kHz; _feed() then assembles fixed-size VAD frames. A resampler
         call can produce zero, one, or several output frames.
 
-        This callback performs resampling and VAD only, never Breeze inference.
+        This callback performs resampling and VAD only, never ASR inference.
         Calls after Stop or an error are ignored. Audio-processing exceptions
         are logged and exposed through snapshot() rather than escaping into
         WebRTC's callback thread.
@@ -396,13 +397,18 @@ class LiveTranscriber:
                         return
                     continue
                 try:
-                    timing["asr_start_ms"] = monotonic() * 1000
-                    text = self._transcribe(audio)
-                    timing["asr_final_ms"] = monotonic() * 1000
+                    parts = prepare_speaker_turns(audio, timing, self._diarization)
+                    for part in parts:
+                        part_timing = {key: value for key, value in part.items() if key != "audio"}
+                        part_timing["asr_start_ms"] = monotonic() * 1000
+                        text = self._transcribe(part["audio"])
+                        part_timing["asr_final_ms"] = monotonic() * 1000
+                        with self._lock:
+                            if text:
+                                self._texts.append(text)
+                                self._timings.append(part_timing)
+                    del parts, part
                     with self._lock:
-                        if text:
-                            self._texts.append(text)
-                            self._timings.append(timing)
                         self._pending -= 1
                 except Exception as exc:
                     logger.exception("Transcription failed")

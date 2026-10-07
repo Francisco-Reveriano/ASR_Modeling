@@ -1,6 +1,7 @@
 """Ordered conversation review layered over independent immutable corrections."""
 
 from copy import deepcopy
+from dataclasses import replace
 from threading import Lock
 import time
 
@@ -84,9 +85,13 @@ class ConversationReviewSession:
     """
 
     def __init__(self, correct, *, config=SlowLaneConfig(), glossary=None,
-                 second_pass_enabled=True, clock=time.monotonic):
+                 conversation_reasoning_effort=None, second_pass_enabled=True, clock=time.monotonic):
         if type(second_pass_enabled) is not bool:
             raise ValueError("second_pass_enabled must be a boolean.")
+        conversation_config = (
+            replace(config, reasoning_effort=conversation_reasoning_effort)
+            if conversation_reasoning_effort is not None else config
+        )
         if glossary is None:
             from src.glossary import Glossary
             glossary = Glossary()
@@ -102,7 +107,7 @@ class ConversationReviewSession:
                                       clock=clock, on_update=self._on_update)
         self.session_id = self._first.session_id
         self._second = (
-            _SequentialReviewSession(correct, config=config, glossary=glossary,
+            _SequentialReviewSession(correct, config=conversation_config, glossary=glossary,
                                      clock=clock, on_update=self._on_update,
                                      session_id=self.session_id)
             if second_pass_enabled else None

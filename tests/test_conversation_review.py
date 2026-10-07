@@ -65,6 +65,24 @@ class ConversationReviewTests(unittest.TestCase):
         self.wait_for(lambda: session.snapshot()["conversation_review"]["reviewed"] == count)
         return session.snapshot()
 
+    def test_live_first_corrections_keep_separate_background_reasoning_and_audit(self):
+        requests = []
+        def review(request):
+            requests.append(deepcopy(request))
+            return confirmed(request)
+        config = SlowLaneConfig(reasoning_effort="low", confidence_threshold=0.8)
+        session = self.session(review, config=config, conversation_reasoning_effort="high")
+        session.submit(["Source"], ["English"])
+        state = self.reviewed(session, 1)
+        self.assertEqual([request["config"]["reasoning_effort"] for request in requests], ["low", "high"])
+        self.assertEqual(state["first_pass"]["config"]["reasoning_effort"], "low")
+        self.assertEqual(state["second_pass"]["config"]["reasoning_effort"], "high")
+        for request in requests:
+            self.assertEqual(request["config"]["model"], "gpt-6-astra")
+            self.assertEqual(request["config"]["confidence_threshold"], 0.8)
+            self.assertEqual(request["config"]["max_output_tokens"], config.max_output_tokens)
+        self.assertEqual(config.reasoning_effort, "low")
+
     def test_independent_first_reviews_and_ordered_second_reviews_publish_without_polling(self):
         first_started, first_later_finished = Event(), Event()
         second_started = [Event(), Event()]

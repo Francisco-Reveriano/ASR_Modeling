@@ -35,6 +35,7 @@ def render_transcript(
     slow_lane: dict | None = None,
     speakers: list[str | None] | None = None,
     providers: tuple[str, ...] = _PROVIDERS,
+    transcription_label: str | None = None,
 ) -> str:
     """Pair each numbered source segment with the selected English translations.
 
@@ -55,9 +56,11 @@ def render_transcript(
     selected = _selected_providers(providers, slow_lane)
     has_astra = "astra" in selected
     extra_class = (" has-slow-lane" if has_astra else "") + f" provider-columns-{len(selected)}"
+    source_badge = f' <small>{escape(transcription_label)}</small>' if transcription_label else ""
+    source_label = f"Original · {escape(transcription_label)}" if transcription_label else "Original"
     headings = (
         f'<div class="conversation-columns{extra_class}" aria-hidden="true"><span>#</span>'
-        '<span>Original transcript</span>'
+        f'<span>Original transcript{source_badge}</span>'
         + ('<span>English <small>OpenAI</small></span>' if "openai" in selected else "")
         + ('<span>English <small class="tencent-heading">Tencent · Local</small></span>'
            if "tencent" in selected else "")
@@ -135,7 +138,7 @@ def render_transcript(
         rows.append(
             f'<li class="transcript-row"{segment_attribute}>'
             f'<span class="line-number" aria-hidden="true">{index + 1:02d}</span>'
-            '<div class="source-cell"><span class="cell-label">Original</span>'
+            f'<div class="source-cell"><span class="cell-label">{source_label}</span>'
             f'{speaker_label}<span class="segment-text">{escape(text)}</span></div>'
             f'{"".join(cells)}</li>'
         )
@@ -275,7 +278,7 @@ def _with_reference(conversation: str, text: str | None, title: str, slow_lane: 
 
 def export_conversation(
     texts, translations, errors, tencent_translations=None, tencent_errors=None,
-    *, slow_lane=None, speakers=None, providers=_PROVIDERS,
+    *, slow_lane=None, speakers=None, providers=_PROVIDERS, transcription_label=None,
 ) -> str:
     """Export the source and selected providers, including unfinished reviews."""
     selected = _selected_providers(providers, slow_lane)
@@ -320,4 +323,5 @@ def export_conversation(
             if entry["live"] != displayed and entry["live"] is not None:
                 lines.append(f"Astra latest visible version: {entry['live']}")
         rows.append("\n".join(lines))
-    return "\n\n".join(rows)
+    source = f"Original transcript model: {transcription_label}\n\n" if rows and transcription_label else ""
+    return source + "\n\n".join(rows)

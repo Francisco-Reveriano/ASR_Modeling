@@ -127,7 +127,8 @@ class DiarizationSessionTests(unittest.TestCase):
             empty.finish()
             empty.finish()
 
-        self.assertEqual(disabled.snapshot(), {"status": "disabled", "segments": [], "pending": 0, "error": None})
+        self.assertEqual(disabled.snapshot(), {"status": "disabled", "segments": [], "pending": 0, "error": None,
+                                                     "processed_seconds": 0.0, "received_seconds": 0.0})
         self.assertEqual(empty.snapshot()["status"], "complete")
         make_backend.assert_not_called()
 
@@ -241,7 +242,8 @@ class DiarizationSessionTests(unittest.TestCase):
             release.set()
             worker.join(timeout=2)
         backend.assert_not_called()
-        self.assertEqual(session.snapshot(), {"status": "disabled", "segments": [], "pending": 0, "error": None})
+        self.assertEqual(session.snapshot(), {"status": "disabled", "segments": [], "pending": 0, "error": None,
+                                                     "processed_seconds": 0.0, "received_seconds": 0.0})
 
     def test_invalid_audio_after_close_or_finish_does_not_replace_terminal_state(self):
         for action, expected in (("close", "disabled"), ("finish", "complete")):
@@ -269,6 +271,7 @@ class DiarizationSessionTests(unittest.TestCase):
                 self.assertFalse(producer.is_alive())
                 self.assertEqual(session.snapshot(), {
                     "status": expected, "segments": [], "pending": 0, "error": None,
+                    "processed_seconds": 0.0, "received_seconds": 0.0,
                 })
                 backend.assert_not_called()
 

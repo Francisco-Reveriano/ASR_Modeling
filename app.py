@@ -1,10 +1,10 @@
 """Run with: python -m streamlit run app.py"""
 
+from dataclasses import replace
 from html import escape
 import json
 import os
 from pathlib import Path
-from time import sleep
 
 from dotenv import load_dotenv
 import streamlit as st
@@ -13,6 +13,10 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 from src.evaluation import mixed_match_score, parse_reference, word_match_score
 from src.glossary import load_glossary
 from src.pipeline import LiveTranscriber, load_transcriber, load_vad
+from src.openai_transcription import TRANSCRIPTION_MODEL, load_openai_transcriber
+from src.realtime_translation import REALTIME_TRANSLATION_MODEL, RealtimeTranslationSession
+from src.speech import ASTRA_SPEECH_MODES, SPEECH_MODELS, SpeechSession, astra_speech_result
+from src.speech_player import render_speech_player
 from src.reasoning import (
     PROMPT_VERSION, correct_translations, correction_output_token_limit, correction_settings,
 )
@@ -20,14 +24,14 @@ from src.reference_tables import (
     parsed_table_reference, read_reference_tables, recommend_columns,
     suggest_header_row, suggest_table, table_columns,
 )
-from src.tencent import TENCENT_ERROR_MESSAGE, translate_with_tencent
+from src.tencent import TENCENT_ERROR_MESSAGE, local_model_status, translate_with_tencent
 from src.translation import ENV_FILE, TranslationSession, background_filter_enabled
 from src.slow_lane import SlowLaneConfig, SlowLaneSession
 from src.conversation_review import ConversationReviewSession
-from src.diarization import DiarizationSession, speaker_labels
+from src.diarization import DiarizationSession, speaker_labels, split_speaker_turns
 from src.subtitle_exports import export_bilingual_csv, export_captions
 from src.ui import export_conversation, render_transcript
-from src.uploads import decode_wav, speech_segments, transcribe_in_background
+from src.uploads import decode_wav, prepare_speaker_turns_in_background, speech_segments, transcribe_in_background
 
 TRANSLATION_TYPES = {
     "Compare all translations": (("openai", "tencent", "astra"), True),
@@ -35,16 +39,19 @@ TRANSLATION_TYPES = {
     "Corrected English": (("openai", "astra"), False),
     "Fully reviewed English": (("openai", "astra"), True),
 }
+DEFAULT_MODEL_PAIR = "gpt-live-transcribe + gpt-6-luna"
+LEGACY_MODEL_PAIR = "Breeze + OpenAI"
+MODEL_PAIRS = (DEFAULT_MODEL_PAIR, LEGACY_MODEL_PAIR, REALTIME_TRANSLATION_MODEL)
 
-st.set_page_config(page_title="Breeze Voice", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="Voice transcription", page_icon="🎙️", layout="wide")
 st.html(Path(__file__).parent / "assets" / "style.css")
 st.markdown(
     '<div class="brand-bar"><div class="brand">'
     '<svg viewBox="0 0 32 32" fill="none" stroke="currentColor" '
     'stroke-width="3" stroke-linecap="round" aria-hidden="true">'
     '<path d="M4 13v6M10 8v16M16 4v24M22 10v12M28 14v4"/></svg>'
-    'breeze <span>/ voice</span></div>'
-    '<div class="local-badge">Breeze + Tencent on this Mac · OpenAI via API</div></div>',
+    'speech <span>/ voice</span></div>'
+    '<div class="local-badge">gpt-live-transcribe + gpt-6-luna · OpenAI</div></div>',
     unsafe_allow_html=True,
 )
 st.title("Voice transcription & translation")
@@ -57,6 +64,54 @@ st.markdown(
 @st.cache_resource(show_spinner=False)
 def get_transcriber():
     return load_transcriber()
+
+
+def selected_transcriber(model_pair):
+    if model_pair == DEFAULT_MODEL_PAIR:
+        return load_openai_transcriber()
+    if model_pair == LEGACY_MODEL_PAIR:
+        return get_transcriber()
+    raise ValueError("Choose a supported transcription model.")
+
+
+def model_selector(key, *, disabled):
+    selected = st.selectbox("Transcription + translation model", MODEL_PAIRS, key=key, disabled=disabled)
+    descriptions = {
+        DEFAULT_MODEL_PAIR: "Audio is sent to OpenAI for transcription; gpt-6-luna translates the transcript.",
+        LEGACY_MODEL_PAIR: "Breeze transcribes on this Mac; transcript text is sent to your configured OpenAI translator.",
+        REALTIME_TRANSLATION_MODEL: "Audio streams to OpenAI for direct English captions. "
+            "Source captions appear separately. This mode uses no Luna, Tencent, Astra, glossary, or speaker processing. "
+            "Uploaded audio streams at playback speed.",
+    }
+    st.caption(descriptions[selected])
+    return selected
+
+
+def speech_controls(prefix, *, disabled, model_pair):
+    enabled = st.toggle("Read English aloud", key=f"{prefix}_speech_enabled", disabled=disabled)
+    model = st.selectbox("Text-to-speech model", SPEECH_MODELS,
+                         key=f"{prefix}_speech_model", disabled=disabled)
+    mode = ASTRA_SPEECH_MODES[0]
+    if enabled and model_pair != REALTIME_TRANSLATION_MODEL:
+        mode = st.selectbox("Astra speech mode", ASTRA_SPEECH_MODES,
+                            key=f"{prefix}_astra_speech_mode", disabled=disabled)
+        if mode == "Live corrections":
+            st.caption("Speaks the first accepted Astra correction. gpt-6-astra uses Low reasoning for speed; "
+                       "background review keeps your configured reasoning. Later text refinements are not replayed.")
+        else:
+            st.caption("Waits for all enabled Astra reviews at your configured reasoning before speaking.")
+    if enabled:
+        st.caption("English speech starts automatically after a 1-minute lead-in, "
+                   "counted from the first accepted translation. "
+                   "A small audio buffer smooths uneven delivery. "
+                   "Astra modes wait for accepted corrections. Use headphones while recording.")
+        if model_pair != REALTIME_TRANSLATION_MODEL:
+            st.toggle("Different voice per speaker", value=True, key=f"{prefix}_speaker_voices", disabled=disabled)
+            st.caption("Uses detected speaker labels. Mixed segments use the dominant speaker; "
+                       "unknown speakers use the default voice.")
+        else:
+            st.caption("Realtime translation uses one voice because it has no speaker labels.")
+    return (model if enabled else None), mode
 
 
 def slow_config():
@@ -81,19 +136,48 @@ def terminology():
     return st.session_state.glossary
 
 
-def translation_configuration(name="Compare all translations"):
+def translation_configuration(name="Compare all translations", model_pair=LEGACY_MODEL_PAIR):
     """Return the provider choices frozen when a conversation starts."""
+    if model_pair == REALTIME_TRANSLATION_MODEL:
+        return {"type": "Realtime English", "providers": ("openai",), "second_review": False,
+                "model_pair": model_pair, "translation_model": REALTIME_TRANSLATION_MODEL}
     providers, second_review = TRANSLATION_TYPES[name]
-    return {"type": name, "providers": providers, "second_review": second_review}
+    return {"type": name, "providers": providers, "second_review": second_review,
+            "model_pair": model_pair,
+            "translation_model": "gpt-6-luna" if model_pair == DEFAULT_MODEL_PAIR else None}
 
 
 def current_translation_configuration():
-    return st.session_state.get("translation_config", translation_configuration())
+    # Preserve the provenance of sessions already in memory after an app update.
+    fallback = LEGACY_MODEL_PAIR if st.session_state.get("transcript_source") else DEFAULT_MODEL_PAIR
+    return st.session_state.get("translation_config", translation_configuration(model_pair=fallback))
+
+
+def original_transcript_label():
+    """Identify the ASR used for these results, independently of translation."""
+    return {
+        DEFAULT_MODEL_PAIR: f"OpenAI ASR · {TRANSCRIPTION_MODEL}",
+        LEGACY_MODEL_PAIR: "Breeze ASR · Local",
+        REALTIME_TRANSLATION_MODEL: "OpenAI ASR · gpt-realtime-whisper",
+    }.get(current_translation_configuration().get("model_pair"))
+
+
+def speech_source_label():
+    selected = current_translation_configuration()
+    if "astra" in selected["providers"]:
+        return f"Astra Correction · {selected.get('astra_speech_mode', 'Full review')}"
+    return "Realtime English" if selected.get("model_pair") == REALTIME_TRANSLATION_MODEL else "OpenAI English"
 
 
 def new_review_session(config, glossary, selected):
-    session_type = ConversationReviewSession if selected["second_review"] else SlowLaneSession
-    return session_type(correct_translations, config=config, glossary=glossary)
+    conversation_effort = config.reasoning_effort
+    if (selected.get("speech_model") and selected.get("astra_speech_mode") == "Live corrections"
+            and config.model == "gpt-6-astra"):
+        config = replace(config, reasoning_effort="low")
+    if selected["second_review"]:
+        return ConversationReviewSession(correct_translations, config=config, glossary=glossary,
+                                         conversation_reasoning_effort=conversation_effort)
+    return SlowLaneSession(correct_translations, config=config, glossary=glossary)
 
 
 def ensure_review_session(texts):
@@ -115,31 +199,42 @@ def correction_callback(lane):
     return on_result
 
 
-def reset_translation(*, translation_type="Compare all translations", diarization_max_pending_seconds=600):
+def reset_translation(*, translation_type="Compare all translations", model_pair=LEGACY_MODEL_PAIR,
+                      diarization_max_pending_seconds=600, speech_model=None,
+                      astra_speech_mode="Live corrections", speaker_voices=True):
     """End old work and allocate independent fast, slow, and speaker workers."""
     # Load configured files before closing a usable previous session. File I/O
     # never runs on the audio, translator, or correction worker's critical path.
-    glossary = load_glossary(
+    glossary = None if model_pair == REALTIME_TRANSLATION_MODEL else load_glossary(
         st.session_state.get("glossary_path") or None,
         st.session_state.get("dnt_path") or None,
     )
-    selected = translation_configuration(translation_type)
+    selected = translation_configuration(translation_type, model_pair)
     config = slow_config() if "astra" in selected["providers"] else None
-    for key in ("translation", "tencent_translation", "slow_lane", "diarization"):
+    for key in ("translation", "tencent_translation", "slow_lane", "diarization", "realtime_translation", "speech"):
         previous = st.session_state.pop(key, None)
         if previous is not None:
             previous.close()
-    st.session_state.glossary = glossary
     st.session_state.translation_config = selected
+    selected["speech_model"] = speech_model
+    selected["astra_speech_mode"] = astra_speech_mode
+    selected["speaker_voices"] = speaker_voices and model_pair != REALTIME_TRANSLATION_MODEL
+    if speech_model is not None:
+        st.session_state.speech = SpeechSession(speech_model, speaker_voices=selected["speaker_voices"])
+    if model_pair == REALTIME_TRANSLATION_MODEL:
+        return
+    st.session_state.glossary = glossary
     lane = new_review_session(config, glossary, selected) if config is not None else None
     if lane is not None:
         st.session_state.slow_lane = lane
     st.session_state.translation = TranslationSession(
         glossary=glossary, on_result=correction_callback(lane) if lane is not None else None,
+        model=selected["translation_model"],
     )
     if "tencent" in selected["providers"]:
         st.session_state.tencent_translation = TranslationSession(
             translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
+            cancellable=True,
         )
     st.session_state.diarization = DiarizationSession(
         enabled=st.session_state.get("enable_diarization", True),
@@ -157,9 +252,12 @@ def conversation_metadata(state, texts):
     if diarization is not None:
         # Legacy sessions have no audio offsets. Keep their speaker unknown
         # rather than inventing a timeline from transcript or reference rows.
+        speaker_state = diarization.snapshot()
+        covered = speaker_state.get("processed_seconds", float("inf"))
         speakers = speaker_labels(
-            [timing if "start_s" in timing and "end_s" in timing else None for timing in timings],
-            diarization.snapshot()["segments"],
+            [timing if "start_s" in timing and "end_s" in timing and
+             (speaker_state["status"] == "complete" or timing["end_s"] <= covered + 1e-6)
+             else None for timing in timings], speaker_state["segments"],
         )
         for timing, speaker in zip(timings, speakers):
             if speaker is not None:
@@ -183,7 +281,8 @@ def conversation_extras(state, texts, translated):
                 "segments": [], "pending": 0, "status": "idle", "metrics": {}}
     slow["view"] = "authoritative" if st.session_state.get("subtitle_view") == "Final record" else "speculative"
     return {"slow_lane": slow, "speakers": speakers,
-            "providers": current_translation_configuration()["providers"]}
+            "providers": current_translation_configuration()["providers"],
+            "transcription_label": original_transcript_label()}
 
 
 def translation_snapshot(texts, state=None):
@@ -193,15 +292,23 @@ def translation_snapshot(texts, state=None):
     deduplicates segment positions across UI polls. Creating a missing provider
     independently also preserves existing results after an app update.
     """
-    providers = current_translation_configuration()["providers"]
+    selected = current_translation_configuration()
+    if selected.get("model_pair") == REALTIME_TRANSLATION_MODEL:
+        return {
+            "openai": (state or {}).get("direct_translation", {"translations": [], "errors": [], "pending": 0}),
+            "tencent": {"translations": [], "errors": [], "pending": 0},
+        }
+    providers = selected["providers"]
     lane = ensure_review_session(texts)
     if texts and "translation" not in st.session_state:
         st.session_state.translation = TranslationSession(
             glossary=terminology(), on_result=correction_callback(lane) if lane is not None else None,
+            model=current_translation_configuration().get("translation_model"),
         )
     if texts and "tencent" in providers and "tencent_translation" not in st.session_state:
         st.session_state.tencent_translation = TranslationSession(
             translate_with_tencent, failure_message=TENCENT_ERROR_MESSAGE,
+            cancellable=True,
         )
     if texts and lane is not None:
         # A fast result can arrive before the next UI refresh. Seed source and
@@ -429,6 +536,28 @@ def correction_status(slow):
         st.warning("Conversation review: " + " ".join(conversation_errors))
 
 
+def local_worker_status():
+    """Show local worker readiness and backlog during and after ASR."""
+    translation = st.session_state.get("tencent_translation")
+    if translation is not None:
+        activity = translation.progress()
+        rows = ", ".join(str(row) for row in activity["active_rows"])
+        st.caption(f"Tencent · Local · {local_model_status()} · "
+                   f"active row {rows or '—'} · {activity['queued']} queued · "
+                   f"{activity['elapsed_s']:.0f}s on current row")
+    speaker_state = None
+    diarization = st.session_state.get("diarization")
+    if diarization is not None:
+        speaker_state = diarization.snapshot()
+        st.caption(f"Nemotron · Speaker detection {speaker_state['status']}")
+        if speaker_state.get("received_seconds"):
+            st.caption(f"Speaker timing: {speaker_state['processed_seconds']:.1f}s / "
+                       f"{speaker_state['received_seconds']:.1f}s processed")
+        if speaker_state.get("error"):
+            st.caption(speaker_state["error"])
+    return speaker_state
+
+
 def transcript_panel(state=None, context=None):
     """Draw the current snapshot without changing the recording session."""
     texts = state["texts"] if state else []
@@ -442,6 +571,8 @@ def transcript_panel(state=None, context=None):
     if state:
         if state["error"]:
             status = "Needs attention"
+        elif state.get("realtime") and is_upload and not state["finished"]:
+            status, tone = "Streaming translation…", "working"
         elif state["pending"]:
             status, tone = "Transcribing…", "working"
         elif state["accepting"]:
@@ -451,7 +582,7 @@ def transcript_panel(state=None, context=None):
             )
         elif state["finished"]:
             status = "Evaluation complete" if is_evaluation else (
-                "File transcribed" if is_upload else "Recording stopped"
+                ("File translated" if state.get("realtime") else "File transcribed") if is_upload else "Recording stopped"
             )
         else:
             status, tone = "Finishing…", "working"
@@ -466,6 +597,13 @@ def transcript_panel(state=None, context=None):
         f'<span class="status-badge {tone}" role="status">{status}</span></div>',
         unsafe_allow_html=True,
     )
+    model_pair = current_translation_configuration().get("model_pair", LEGACY_MODEL_PAIR)
+    realtime = model_pair == REALTIME_TRANSLATION_MODEL
+    st.caption(f"Transcription + translation: {model_pair}")
+    if realtime and state:
+        st.caption("Continuous English captions · " + (
+            "Incomplete" if state["error"] else "Complete" if state["finished"] else "Streaming"
+        ))
     if state and state["error"]:
         st.error(state["error"])
     if is_upload:
@@ -491,12 +629,12 @@ def transcript_panel(state=None, context=None):
         if provider not in extras["providers"]:
             continue
         result = translated[provider]
-        if result["pending"]:
+        if result["pending"] and not realtime:
             st.caption(f"{label} · Translating {result['pending']} segment(s) into English")
         errors = list(dict.fromkeys(error for error in result["errors"] if error))
         if errors:
             st.warning(f"{label}: {' '.join(errors)}")
-            if st.button(f"Retry {label}", key=retry_key, icon=":material/refresh:"):
+            if not realtime and st.button(f"Retry {label}", key=retry_key, icon=":material/refresh:"):
                 st.session_state[key].retry_failed()
                 st.rerun()
     if is_evaluation:
@@ -506,17 +644,21 @@ def transcript_panel(state=None, context=None):
     slow_status = slow["status"]
     if "astra" in extras["providers"]:
         correction_status(slow)
-    diarization = st.session_state.get("diarization")
-    if diarization is not None:
-        speaker_state = diarization.snapshot()
-        st.caption(f"Nemotron · Speaker detection {speaker_state['status']}")
-        if speaker_state.get("error"):
-            st.caption(speaker_state["error"])
+    speaker_state = local_worker_status()
     st.markdown(
         render_transcript(*conversation_args(texts, translated), **extras, **reference_view_args(state)),
         unsafe_allow_html=True,
     )
-    download_text = export_conversation(*conversation_args(texts, translated), **extras)
+    download_text = (
+        f"Transcription + translation: {model_pair}\n\n"
+        + export_conversation(*conversation_args(texts, translated), **extras)
+    )
+    speech_model = current_translation_configuration().get("speech_model")
+    if speech_model:
+        download_text = f"Text-to-speech: {speech_model} ({speech_source_label()})\n" + download_text
+    if realtime and state:
+        completion = "Incomplete" if state["error"] else "Complete" if state["finished"] else "Streaming — incomplete"
+        download_text = f"English captions: {completion}\n" + download_text
     if is_evaluation:
         download_text += "\n\n" + evaluation_report(state, results)
     if slow.get("segments"):
@@ -530,8 +672,10 @@ def transcript_panel(state=None, context=None):
                      "config": slow.get("config", {}), "learned_terms": slow.get("learned_terms", [])})
             record = dict(slow, prompt_version=PROMPT_VERSION,
                           translation_config=current_translation_configuration())
-            if diarization is not None:
+            if speaker_state is not None:
                 record["diarization"] = speaker_state
+            if st.session_state.get("speech") is not None:
+                record["speech_voices"] = st.session_state.speech.snapshot()["voices"]
             st.download_button(
                 "Download session JSON", json.dumps(record, ensure_ascii=False, indent=2),
                 "breeze-session.json", "application/json", key="download_session", on_click="ignore",
@@ -550,8 +694,10 @@ def transcript_panel(state=None, context=None):
     with st.container(key="transcript_footer"):
         count_column, download_column = st.columns([1, 1], vertical_alignment="center")
         count_column.markdown(
-            f'<span class="segment-count">{len(texts)} '
-            f'{"segment" if len(texts) == 1 else "segments"} · Numbered by pause</span>',
+            '<span class="segment-count">Continuous source and English captions</span>' if realtime else (
+                f'<span class="segment-count">{len(texts)} '
+                f'{"segment" if len(texts) == 1 else "segments"} · Numbered by pause</span>'
+            ),
             unsafe_allow_html=True,
         )
         download_column.download_button(
@@ -578,6 +724,52 @@ def show_transcript(session=None, context=None, control_state=None):
     transcript_panel(state, context)
 
 
+@st.fragment(run_every=0.25)
+def show_speech():
+    """Deliver PCM independently of caption rendering, ASR and correction work."""
+    speech = st.session_state.get("speech")
+    if speech is None:
+        render_speech_player(armed=bool(st.session_state.get("microphone_speech_enabled") or
+                                       st.session_state.get("upload_speech_enabled")))
+        return
+    # Keep the iframe in the same first slot as standby so Start/Transcribe's
+    # gesture-unlocked AudioContext survives the transition into a session.
+    render_speech_player(speech)
+    if st.session_state.get("transcript_source") == "upload":
+        state = st.session_state.get("upload_state", {})
+        job = st.session_state.get("upload_job", {})
+        if job.get("realtime_session") is not None:
+            state = job["realtime_session"].snapshot()
+    else:
+        recording = st.session_state.get("recording")
+        state = recording.snapshot() if recording else {}
+    texts = state.get("texts", [])
+    translated = translation_snapshot(texts, state)
+    selected = current_translation_configuration()
+    _, speakers = conversation_metadata(state, texts)
+    if "astra" in selected["providers"]:
+        slow = conversation_extras(state, texts, translated)["slow_lane"]
+        result = astra_speech_result(slow, segment_count=len(texts),
+                                    conversation_review=selected["second_review"] and
+                                    selected.get("astra_speech_mode", "Full review") == "Full review")
+    else:
+        result = translated["openai"]
+    speech.submit(result, speakers=speakers, realtime=bool(state.get("realtime")),
+                  final=bool(state.get("finished") and not result["pending"]))
+    st.caption(f"Spoken English · {speech.model} · {speech_source_label()} · 1-minute lead-in")
+    if "astra" in selected["providers"] and result["pending"]:
+        st.caption("Voice waits for Astra's accepted corrections in conversation order. "
+                   "Pending, paused or failed reviews are not spoken. Retry failed corrections to continue.")
+    status = speech.snapshot()
+    if status["voices"] and status["speaker_voices"]:
+        st.caption("Voices · " + " · ".join(f"{speaker}: {voice.capitalize()}"
+                                          for speaker, voice in status["voices"].items()))
+    if status["error"]:
+        st.warning(status["error"])
+    if status["skipped"]:
+        st.caption(f"Voice skipped {status['skipped']} unavailable English segment(s).")
+
+
 def recording_panel():
     session = st.session_state.get("recording")
     context = st.session_state.get("microphone_context")
@@ -588,6 +780,8 @@ def recording_panel():
         or st.session_state.get("upload_job") is not None
     )
 
+    model_pair = model_selector("microphone_model_pair", disabled=busy)
+    speech_model, astra_speech_mode = speech_controls("microphone", disabled=busy, model_pair=model_pair)
     start_column, stop_column = st.columns(2)
     start = start_column.button(
         "Start recording", disabled=busy, type="primary", icon=":material/mic:",
@@ -600,15 +794,23 @@ def recording_panel():
     if start:
         st.session_state.model_error = None
         try:
-            with st.spinner("Loading local speech models…"):
-                transcribe = get_transcriber()
-                vad = load_vad()
+            with st.spinner("Preparing speech recognition…"):
+                if model_pair == REALTIME_TRANSLATION_MODEL:
+                    prepared_realtime = RealtimeTranslationSession()
+                else:
+                    transcribe = selected_transcriber(model_pair)
+                    vad = load_vad()
             reset_translation(translation_type=st.session_state.get(
                 "microphone_translation_type", "Compare all translations",
-            ))
-            session = LiveTranscriber(transcribe, vad, diarization=st.session_state.diarization)
+            ), model_pair=model_pair, speech_model=speech_model, astra_speech_mode=astra_speech_mode,
+                speaker_voices=st.session_state.get("microphone_speaker_voices", True))
+            if model_pair == REALTIME_TRANSLATION_MODEL:
+                session = prepared_realtime
+                st.session_state.realtime_translation = session
+            else:
+                session = LiveTranscriber(transcribe, vad, diarization=st.session_state.diarization)
         except Exception as exc:
-            st.session_state.model_error = f"Could not load the local speech models: {exc}"
+            st.session_state.model_error = f"Could not prepare speech recognition: {exc}"
         else:
             st.session_state.recording = session
             st.session_state.recording_number = st.session_state.get("recording_number", 0) + 1
@@ -633,7 +835,7 @@ def recording_panel():
     with st.expander("Microphone settings", icon=":material/tune:"):
         st.selectbox(
             "Translation type", list(TRANSLATION_TYPES), key="microphone_translation_type",
-            disabled=busy or bool(session and not session.snapshot()["finished"]),
+            disabled=busy or model_pair == REALTIME_TRANSLATION_MODEL or bool(session and not session.snapshot()["finished"]),
             help="Applies to the next recording. Fast uses OpenAI; Corrected adds Astra; "
                  "Fully reviewed adds a conversation review. Compare all also runs Tencent locally.",
         )
@@ -644,7 +846,9 @@ def recording_panel():
                 key=f"microphone-{st.session_state.recording_number}",
                 mode=WebRtcMode.SENDONLY,
                 desired_playing_state=session.snapshot()["accepting"],
-                media_stream_constraints={"video": False, "audio": True},
+                media_stream_constraints={"video": False, "audio": {
+                    "echoCancellation": True, "noiseSuppression": True,
+                }},
                 rtc_configuration={"iceServers": []},
                 audio_frame_callback=session.push,
                 on_audio_ended=session.finish,
@@ -792,6 +996,11 @@ def upload_panel(session, context, *, evaluate=False):
         or (state and not state["finished"])
     )
     busy = live_busy or st.session_state.get("upload_job") is not None
+    # Evaluation retains its existing Breeze baseline and local-audio behavior.
+    model_pair = LEGACY_MODEL_PAIR if evaluate else model_selector("upload_model_pair", disabled=busy)
+    speech_model, astra_speech_mode = (None, ASTRA_SPEECH_MODES[0]) if evaluate else speech_controls(
+        "upload", disabled=busy, model_pair=model_pair,
+    )
     error_key = "evaluation_error" if evaluate else "upload_error"
     uploaded = st.file_uploader(
         "Evaluation audio (.wav)" if evaluate else "Choose a WAV file",
@@ -816,20 +1025,30 @@ def upload_panel(session, context, *, evaluate=False):
                 raise ValueError(reference_error)
             with st.spinner("Reading WAV audio…"):
                 audio = decode_wav(uploaded.getvalue())
-            reset_translation(diarization_max_pending_seconds=max(600, len(audio) / 16000 + 1))
+            realtime_session = RealtimeTranslationSession() if model_pair == REALTIME_TRANSLATION_MODEL else None
+            reset_translation(model_pair=model_pair,
+                              diarization_max_pending_seconds=max(600, len(audio) / 16000 + 1),
+                              speech_model=speech_model, astra_speech_mode=astra_speech_mode,
+                              speaker_voices=st.session_state.get("upload_speaker_voices", True))
         except (ValueError, OSError) as exc:
             st.session_state[error_key] = str(exc)
         else:
             st.session_state.upload_job = {
                 "audio": audio, "name": uploaded.name, "next_segment": 0,
+                "model_pair": model_pair,
             }
             st.session_state.upload_state = {
                 "texts": [], "pending": 0, "accepting": False,
                 "finished": False, "error": None, "name": uploaded.name,
                 "timings": [],
             }
-            st.session_state.diarization.push(audio)
-            st.session_state.diarization.finish()
+            if realtime_session is not None:
+                st.session_state.realtime_translation = realtime_session
+                st.session_state.upload_job["realtime_session"] = realtime_session
+                realtime_session.start_file(st.session_state.upload_job.pop("audio"))
+            else:
+                st.session_state.diarization.push(audio)
+                st.session_state.diarization.finish()
             if evaluate:
                 st.session_state.upload_state["evaluation"] = evaluation
             st.session_state.transcript_source = "upload"
@@ -849,6 +1068,27 @@ def upload_panel(session, context, *, evaluate=False):
         st.caption("Preview your audio, then transcribe it. A new transcription replaces the current text.")
 
 
+@st.fragment(run_every=0.5)
+def show_realtime_upload():
+    job = st.session_state.upload_job
+    state = st.session_state.upload_state
+    state.update(job["realtime_session"].snapshot())
+    if state["finished"]:
+        st.session_state.pop("upload_job")
+        st.rerun()
+    st.progress(min(1.0, state["sent_seconds"] / max(state["duration"], 0.001)),
+                text="Streaming file audio into English…")
+    if st.button("Stop file translation", key="stop_realtime_upload"):
+        job["realtime_session"].close()
+        state.update(job["realtime_session"].snapshot())
+        state.update(finished=True, accepting=False, error="File translation stopped. Captions are incomplete.")
+        state["direct_translation"]["pending"] = 0
+        st.session_state.pop("upload_job")
+        st.rerun()
+    transcript_panel(state)
+
+
+@st.fragment(run_every=0.5)
 def process_upload():
     """Transcribe file segments in order, without filling the live audio queue.
 
@@ -860,6 +1100,9 @@ def process_upload():
     No file or transcript is written to disk.
     """
     job = st.session_state.upload_job
+    if job.get("model_pair") == REALTIME_TRANSLATION_MODEL:
+        show_realtime_upload()
+        return
     state = st.session_state.upload_state
     st.markdown(
         '<div class="transcript-heading"><h2>Your conversation</h2>'
@@ -874,23 +1117,59 @@ def process_upload():
         state["pending"] = len(segments) - job["next_segment"]
         # Silence should not require loading the large speech model.
         if segments:
-            with st.spinner("Loading local speech model…"):
-                transcribe = get_transcriber()
+            model_pair = job.get("model_pair", LEGACY_MODEL_PAIR)
+
+            def transcribe(audio):
+                # Model loading and inference both belong to the background task.
+                return selected_transcriber(model_pair)(audio)
+
             progress = st.progress(
                 job["next_segment"] / len(segments),
                 text=f"Transcribing {len(segments)} speech segment(s)…",
             )
+            translated = translation_snapshot(state["texts"], state)
+            local_worker_status()
             output = st.empty()
+            output.markdown(
+                render_transcript(
+                    *conversation_args(state["texts"], translated),
+                    **conversation_extras(state, state["texts"], translated), **reference_view_args(state),
+                ), unsafe_allow_html=True,
+            )
             for index in range(job["next_segment"], len(segments)):
                 segment = segments[index]
+                if isinstance(segment, dict) and not segment.get("_turns_prepared"):
+                    diarization = st.session_state.diarization
+                    speaker_state = diarization.snapshot()
+                    if "speaker_task" in job:
+                        if not job["speaker_task"].done():
+                            st.caption("Preparing speaker turns locally… Translations and audio continue independently.")
+                            return
+                        parts = job.pop("speaker_task").result()
+                    elif ("end_s" in segment and speaker_state["status"] == "active" and
+                          speaker_state.get("processed_seconds", 0) < segment["end_s"]):
+                        job["speaker_task"] = prepare_speaker_turns_in_background(segment, diarization)
+                        st.caption("Preparing speaker turns locally… Translations and audio continue independently.")
+                        return
+                    else:
+                        timing = {key: value for key, value in segment.items() if key != "audio"}
+                        parts = split_speaker_turns(segment["audio"], timing, speaker_state["segments"])
+                    for part in parts:
+                        part["_turns_prepared"] = True
+                    segments[index:index + 1] = parts
+                    if len(parts) > 1:
+                        # Recompute the loop bound/progress after adding speaker turns.
+                        state["pending"] = len(segments) - job["next_segment"]
+                        return
+                    segment = parts[0]
                 # Compatibility for older in-flight jobs that stored bare arrays.
-                timing = {key: value for key, value in segment.items() if key != "audio"} if isinstance(segment, dict) else {}
+                timing = {key: value for key, value in segment.items() if key not in {"audio", "_turns_prepared"}} if isinstance(segment, dict) else {}
                 if "asr_task" not in job:
                     job["asr_task"] = transcribe_in_background(
                         transcribe, segment["audio"] if isinstance(segment, dict) else segment,
                     )
                 task = job["asr_task"]
-                while not task.done():
+                if not task.done():
                     # Keep completed fast drafts and corrections flowing while
                     # the next local decode waits for GPU access or inference.
                     translated = translation_snapshot(state["texts"], state)
@@ -902,7 +1181,9 @@ def process_upload():
                         ),
                         unsafe_allow_html=True,
                     )
-                    sleep(0.1)
+                    # Never hold Streamlit's render thread waiting for ASR.
+                    # The fragment polls this same Future without repeating it.
+                    return
                 text, timing["asr_start_ms"], timing["asr_final_ms"] = task.result()
                 if text:
                     state["texts"].append(text)
@@ -923,6 +1204,8 @@ def process_upload():
                     (index + 1) / len(segments),
                     text=f"Transcribed {index + 1} of {len(segments)} speech segments",
                 )
+                if st.session_state.get("speech") is not None and index + 1 < len(segments):
+                    return
     except Exception as exc:
         action = "Run evaluation" if "evaluation" in state else "Transcribe file"
         state["error"] = f"Could not transcribe this WAV file: {exc}. You can retry {action}."
@@ -954,7 +1237,8 @@ def translation_controls():
         except ValueError as exc:
             st.error(str(exc))
         else:
-            st.caption(f"{model} · {reasoning_effort.capitalize()} reasoning · Reviews fast OpenAI drafts asynchronously.")
+            st.caption(f"{model} · {reasoning_effort.capitalize()} reasoning · Configured review setting. "
+                       "Live corrections speech uses Low reasoning for the first gpt-6-astra pass.")
         st.selectbox("Astra view", ["Live subtitles", "Final record"], key="subtitle_view")
         st.toggle("Nemotron speaker detection", value=True, key="enable_diarization", disabled=busy)
         st.caption("Speaker detection runs locally. Settings below apply to the next recording or file.")
@@ -1023,14 +1307,19 @@ with input_column, st.container(key="input_card"):
     with evaluation_tab:
         upload_panel(session, context, evaluate=True)
     st.markdown(
-        '<div class="privacy-note">Audio and Tencent translation stay on this Mac. '
-        'Transcript text and configured glossary context go to OpenAI for fast translation and Astra corrections.</div>',
+        '<div class="privacy-note">OpenAI transcription sends audio to OpenAI. '
+        'Breeze keeps audio on this Mac. Transcript text and glossary context go to OpenAI '
+        'for translation and Astra corrections. Evaluation references and Tencent processing stay local.</div>',
         unsafe_allow_html=True,
     )
 
 with transcript_column, st.container(key="transcript_card"):
+    show_speech()
     if st.session_state.get("upload_job") is not None:
-        process_upload()
+        if st.session_state.upload_job.get("model_pair") == REALTIME_TRANSLATION_MODEL:
+            show_realtime_upload()
+        else:
+            process_upload()
     elif st.session_state.get("transcript_source") == "upload":
         show_transcript()
     elif session is None:
@@ -1040,6 +1329,8 @@ with transcript_column, st.container(key="transcript_card"):
         show_transcript(session, context, (state["accepting"], state["finished"]))
 
 st.markdown(
+    '<p class="workspace-note">Realtime translation streams continuous English captions alongside source text.</p>'
+    if current_translation_configuration().get("model_pair") == REALTIME_TRANSLATION_MODEL else
     '<p class="workspace-note">One line per speech segment. '
     'Astra reviews source text and fast drafts. '
     'Speaker labels update independently; reference lines follow the uploaded file.</p>',

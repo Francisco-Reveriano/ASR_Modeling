@@ -1,6 +1,7 @@
 """Verify Streamlit recording state without models or microphone access."""
 
 from io import BytesIO
+from copy import deepcopy
 import gc
 import json
 import os
@@ -45,8 +46,10 @@ class FakeTranslationSession:
 
     def __init__(self, translate=None, *, failure_message=None, glossary=None,
                  source_lang="zh-TW+en", target_lang="en", initial_results=None,
-                 initial_errors=None, initial_filtered=None, on_result=None):
+                 initial_errors=None, initial_filtered=None, on_result=None, model=None,
+                 cancellable=False):
         self.translate = translate
+        self.model = model
         self.failure_message = failure_message
         self.provider = "Tencent" if translate is not None else "English"
         self.initial_results = initial_results
@@ -92,6 +95,34 @@ class FakeTranslationSession:
             ),
         }
 
+    def progress(self):
+        return {"active_rows": [], "queued": self.snapshot()["pending"], "elapsed_s": 0}
+
+
+class FakeRealtimeSession:
+    def __init__(self):
+        self._worker = Thread()
+        self.state = {"texts": [], "timings": [], "pending": 0, "accepting": True,
+                      "finished": False, "error": None, "realtime": True,
+                      "sent_seconds": 0, "duration": 1,
+                      "direct_translation": {"translations": [], "errors": [], "pending": 1}}
+        self.finish = Mock(side_effect=self._finish)
+        self.close = Mock(side_effect=self._finish)
+        self.push = Mock(side_effect=lambda frame: frame)
+        self.start_file = Mock(side_effect=self._start_file)
+
+    def _finish(self):
+        self.state.update(accepting=False, finished=True)
+        self.state["direct_translation"]["pending"] = 0
+
+    def _start_file(self, audio):
+        self.state.update(texts=["你好"], sent_seconds=len(audio) / 16000, duration=len(audio) / 16000)
+        self.state["direct_translation"] = {"translations": ["Hello."], "errors": [None], "pending": 0}
+        self._finish()
+
+    def snapshot(self):
+        return deepcopy(self.state)
+
 
 class RecordingAppTests(unittest.TestCase):
     def setUp(self):
@@ -112,6 +143,24 @@ class RecordingAppTests(unittest.TestCase):
         self.load_transcriber = self.start_patch(
             "src.pipeline.load_transcriber", return_value=self.transcribe,
         )
+        self.cloud_transcribe = Mock(return_value="Cloud transcript")
+        self.load_openai_transcriber = self.start_patch(
+            "src.openai_transcription.load_openai_transcriber", return_value=self.cloud_transcribe,
+        )
+        self.make_realtime = self.start_patch(
+            "src.realtime_translation.RealtimeTranslationSession", side_effect=FakeRealtimeSession,
+        )
+        from src.speech import SpeechSession
+        self.spoken = []
+        self.spoken_voices = []
+        def synthesize(text, *, model, voice="coral"):
+            self.spoken.append((text, model))
+            self.spoken_voices.append((text, voice))
+            yield b"\x00\x00" * 4800
+        self.make_speech = self.start_patch(
+            "src.speech.SpeechSession", side_effect=lambda model, **kwargs: SpeechSession(model, synthesize=synthesize, **kwargs),
+        )
+        self.speech_player = self.start_patch("src.speech_player.render_speech_player")
         self.load_vad = self.start_patch("src.pipeline.load_vad", return_value=self.vad)
         self.webrtc = self.start_patch(
             "streamlit_webrtc.webrtc_streamer", return_value=self.context,
@@ -134,6 +183,11 @@ class RecordingAppTests(unittest.TestCase):
             "src.diarization.DiarizationSession", return_value=self.diarization,
         )
         self.app = AppTest.from_file(str(APP_FILE)).run()
+        self.default_model_choices = [self.app.selectbox(key=key).value
+                                      for key in ("microphone_model_pair", "upload_model_pair")]
+        # Existing lifecycle/evaluation fixtures exercise the preserved Breeze path.
+        self.app.selectbox(key="microphone_model_pair").set_value("Breeze + OpenAI")
+        self.app.selectbox(key="upload_model_pair").set_value("Breeze + OpenAI").run()
         self.addCleanup(self.finish_current_recording)
         self.assertEqual(len(self.app.exception), 0)
 
@@ -181,6 +235,13 @@ class RecordingAppTests(unittest.TestCase):
             self.assertFalse(session._worker.is_alive())
         if "slow_lane" in self.app.session_state:
             self.app.session_state["slow_lane"].close()
+        if "realtime_translation" in self.app.session_state:
+            self.app.session_state["realtime_translation"].close()
+        if "speech" in self.app.session_state:
+            speech = self.app.session_state["speech"]
+            speech.close()
+            if speech._worker:
+                speech._worker.join(3)
 
     def start_recording(self):
         self.app.button(key="start_recording").click().run()
@@ -287,6 +348,389 @@ class RecordingAppTests(unittest.TestCase):
         ])
         self.assertFalse(control.disabled)
         self.make_translation.assert_not_called()
+
+    def test_speech_controls_offer_requested_models_and_are_opt_in(self):
+        for prefix in ("microphone", "upload"):
+            self.assertEqual(self.app.selectbox(key=f"{prefix}_speech_model").options,
+                             ["gpt-4o-mini-tts", "tts-1-hd"])
+            self.assertEqual(self.app.selectbox(key=f"{prefix}_speech_model").value, "gpt-4o-mini-tts")
+            self.assertFalse(self.app.toggle(key=f"{prefix}_speech_enabled").value)
+        self.make_speech.assert_not_called()
+
+    def test_player_is_armed_before_start_and_detected_speaker_selects_voice(self):
+        self.app.toggle(key="microphone_speech_enabled").set_value(True).run()
+        self.speech_player.assert_called_with(armed=True)
+        self.assertTrue(self.app.toggle(key="microphone_speaker_voices").value)
+        self.make_speech.assert_not_called()
+        self.diarization.snapshot.return_value = {
+            "status": "complete", "error": None, "pending": 0,
+            "segments": [{"start_s": 0, "end_s": 1, "speaker_id": "Speaker 2"}],
+        }
+        session = self.start_recording()
+        self.enterContext(patch.object(session, "snapshot", return_value={
+            "texts": ["Source speech"], "timings": [{"start_s": 0, "end_s": 1}], "pending": 0,
+            "accepting": False, "finished": True, "error": None,
+        }))
+        self.app.run()
+        self.wait_for_corrections()
+        self.app.run()
+        self.app.session_state["speech"]._worker.join(2)
+        self.assertEqual(self.spoken_voices, [("English segment 1.", "onyx")])
+        self.assertIn("1-minute lead-in", self.rendered_text())
+        self.assertEqual(self.app.session_state["speech"].snapshot()["voices"], {"Speaker 2": "onyx"})
+
+    def test_realtime_microphone_speaks_only_english_and_new_session_cancels_voice(self):
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-realtime-translate")
+        self.app.toggle(key="microphone_speech_enabled").set_value(True).run()
+        recording = self.start_recording()
+        speech = self.app.session_state["speech"]
+        self.assertTrue(self.app.toggle(key="microphone_speech_enabled").disabled)
+        recording.state["texts"] = ["你好"]
+        recording.state["direct_translation"] = {"translations": ["Hello. Next"], "errors": [None], "pending": 1}
+        self.app.run()
+        deadline = monotonic() + 2
+        while not self.spoken and monotonic() < deadline:
+            sleep(0.005)
+        self.assertEqual(self.spoken, [("Hello.", "gpt-4o-mini-tts")])
+        self.assertFalse(speech.snapshot()["complete"])
+        self.app.button(key="stop_recording").click().run()
+        self.app.toggle(key="microphone_speech_enabled").set_value(False).run()
+        self.start_recording()
+        self.assertTrue(speech.snapshot()["closed"])
+        self.assertEqual(speech.snapshot()["chunks"], [])
+        self.assertNotIn("speech", self.app.session_state)
+
+    def test_microphone_freezes_selected_hd_speech_model_for_the_conversation(self):
+        self.app.toggle(key="microphone_speech_enabled").set_value(True)
+        self.app.selectbox(key="microphone_speech_model").set_value("tts-1-hd").run()
+        self.start_recording()
+        self.assertEqual(self.app.session_state["speech"].model, "tts-1-hd")
+        self.assertEqual(self.app.session_state["translation_config"]["speech_model"], "tts-1-hd")
+        self.assertTrue(self.app.selectbox(key="microphone_speech_model").disabled)
+
+    def test_realtime_upload_uses_own_speech_setting_and_flushes_final_english(self):
+        self.app.selectbox(key="upload_model_pair").set_value("gpt-realtime-translate")
+        self.app.selectbox(key="upload_speech_model").set_value("tts-1-hd")
+        self.app.toggle(key="upload_speech_enabled").set_value(True).run()
+        self.select_wav()
+        self.transcribe_file()
+        speech = self.app.session_state["speech"]
+        self.app.run()
+        speech._worker.join(2)
+        self.assertEqual(self.spoken, [("Hello.", "tts-1-hd")])
+        self.app.run()
+        self.assertEqual(len(self.spoken), 1)
+        self.assertFalse(self.app.toggle(key="microphone_speech_enabled").value)
+        self.assertEqual(self.app.session_state["translation_config"]["speech_model"], "tts-1-hd")
+
+    def test_segmented_upload_yields_for_live_voice_and_never_speaks_tencent_or_reference(self):
+        self.app.toggle(key="upload_speech_enabled").set_value(True).run()
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)] * 2)
+        self.select_wav()
+        self.transcribe_file()
+        for _ in range(10):
+            self.app.run()
+            if "upload_job" not in self.app.session_state:
+                break
+        self.app.run()
+        self.assertNotIn("upload_job", self.app.session_state)
+        speech = self.app.session_state["speech"]
+        speech._worker.join(2)
+        self.assertEqual([text for text, _ in self.spoken], ["English segment 1.", "English segment 2."])
+        self.assertEqual(self.transcribe.call_count, 2)
+        self.speech_player.assert_called()
+        self.app.run()
+        self.assertEqual(len(self.spoken), 2)
+
+    def test_speech_waits_for_astra_conversation_correction_and_uses_its_text(self):
+        first_entered, second_entered, release_first, release_second = Event(), Event(), Event(), Event()
+        self.addCleanup(release_first.set)
+        self.addCleanup(release_second.set)
+
+        def correct(request):
+            second = request.get("review_stage") == "conversation"
+            (second_entered if second else first_entered).set()
+            if not (release_second if second else release_first).wait(10):
+                raise RuntimeError("Test correction was not released")
+            row = request["segments"][0]
+            return {"corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": "Astra final English." if second else "Astra initial correction.",
+                "change_type": ["style"], "confidence": 0.95,
+                "rationale": "Clarify the wording.", "term_pairs": [],
+            }], "no_change": []}
+
+        self.correct.side_effect = correct
+        self.app.toggle(key="upload_speech_enabled").set_value(True).run()
+        self.app.selectbox(key="upload_astra_speech_mode").set_value("Full review").run()
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)])
+        self.select_wav()
+        downloads = self.capture_downloads()
+        self.transcribe_file()
+        for _ in range(5):
+            self.app.run()
+            if "upload_job" not in self.app.session_state:
+                break
+        self.assertTrue(first_entered.wait(1))
+        self.app.run()
+        self.assertEqual(self.spoken, [])
+        self.assertIn("Astra Correction", self.rendered_text())
+        self.assertIn("gpt-4o-mini-tts (Astra Correction · Full review)", downloads[-1])
+        release_first.set()
+        self.assertTrue(second_entered.wait(1))
+        self.app.run()
+        self.assertEqual(self.spoken, [])
+        self.assertIn("Astra initial correction.", self.transcript_html())
+        release_second.set()
+        self.wait_for_corrections()
+        self.app.run()
+        self.app.session_state["speech"]._worker.join(2)
+        self.assertEqual(self.spoken, [("Astra final English.", "gpt-4o-mini-tts")])
+        self.app.run()
+        self.assertEqual(len(self.spoken), 1)
+
+    def test_live_astra_speech_arrives_while_high_reasoning_conversation_review_is_pending(self):
+        entered, release = Event(), Event()
+        self.addCleanup(release.set)
+        requests = []
+
+        def correct(request):
+            requests.append(request)
+            second = request.get("review_stage") == "conversation"
+            if second:
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError("Test review was not released")
+            row = request["segments"][0]
+            return {"corrections": [{
+                "segment_id": row["segment_id"], "base_version": row["base_version"],
+                "target_text": "Later reviewed wording." if second else "Accepted Astra correction.",
+                "change_type": ["style"], "confidence": 0.95,
+                "rationale": "Clarify the wording.", "term_pairs": [],
+            }], "no_change": []}
+
+        self.enterContext(patch.dict(os.environ, {"OPENAI_CORRECTION_REASONING_EFFORT": "high"}))
+        self.correct.side_effect = correct
+        self.app.toggle(key="microphone_speech_enabled").set_value(True).run()
+        self.assertEqual(self.app.selectbox(key="microphone_astra_speech_mode").value, "Live corrections")
+        session = self.start_recording()
+        self.enterContext(patch.object(session, "snapshot", return_value={
+            "texts": ["Source speech"], "timings": [], "pending": 0,
+            "accepting": False, "finished": True, "error": None,
+        }))
+        self.app.run()
+        self.assertTrue(entered.wait(1))
+        self.app.run()
+        self.app.session_state["speech"]._worker.join(2)
+        self.assertEqual(self.spoken, [("Accepted Astra correction.", "gpt-4o-mini-tts")])
+        self.assertEqual([request["config"]["reasoning_effort"] for request in requests], ["low", "high"])
+        # Editing the next conversation's option cannot change the current voice.
+        self.app.selectbox(key="microphone_astra_speech_mode").set_value("Full review").run()
+        self.assertEqual(self.app.session_state["translation_config"]["astra_speech_mode"], "Live corrections")
+        release.set()
+        self.wait_for_corrections()
+        self.app.run()
+        self.assertIn("Later reviewed wording.", self.transcript_html())
+        self.assertEqual(len(self.spoken), 1)
+
+    def test_corrected_microphone_speech_uses_first_pass_when_context_review_is_disabled(self):
+        self.app.toggle(key="microphone_speech_enabled").set_value(True)
+        self.app.selectbox(key="microphone_translation_type").set_value("Corrected English").run()
+        session = self.start_recording()
+        lane = self.app.session_state["slow_lane"]
+        # Feed the same completed transcript state the recording worker exposes.
+        self.enterContext(patch.object(session, "snapshot", return_value={
+            "texts": ["Source speech"], "timings": [], "pending": 0,
+            "accepting": False, "finished": True, "error": None,
+        }))
+        self.app.run()
+        self.wait_for_corrections()
+        self.app.run()
+        self.app.session_state["speech"]._worker.join(2)
+        self.assertEqual(self.spoken, [("English segment 1.", "gpt-4o-mini-tts")])
+        self.assertEqual(lane.snapshot()["statuses"], ["confirmed"])
+        self.assertEqual(self.review_requests(conversation=True), [])
+
+    def test_evaluation_does_not_create_speech_from_upload_or_microphone_settings(self):
+        self.app.toggle(key="upload_speech_enabled").set_value(True)
+        self.app.toggle(key="microphone_speech_enabled").set_value(True).run()
+        self.start_patch("src.uploads.speech_segments", return_value=[])
+        self.select_evaluation()
+        self.evaluate_file()
+        self.make_speech.assert_not_called()
+
+    def test_openai_pair_is_default_for_both_inputs(self):
+        self.assertEqual(self.default_model_choices, ["gpt-live-transcribe + gpt-6-luna"] * 2)
+        for key in ("microphone_model_pair", "upload_model_pair"):
+            self.assertEqual(self.app.selectbox(key=key).options,
+                             ["gpt-live-transcribe + gpt-6-luna", "Breeze + OpenAI", "gpt-realtime-translate"])
+        self.load_openai_transcriber.assert_not_called()
+
+    def test_realtime_microphone_renders_direct_english_without_text_model_workers(self):
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-realtime-translate").run()
+        self.assertTrue(self.app.selectbox(key="microphone_translation_type").disabled)
+        session = self.start_recording()
+        self.assertIs(self.app.session_state["realtime_translation"], session)
+        self.assertEqual(self.app.session_state["translation_config"]["translation_model"], "gpt-realtime-translate")
+        self.assertEqual(self.app.session_state["translation_config"]["providers"], ("openai",))
+        session.state["texts"] = ["你好"]
+        session.state["direct_translation"] = {"translations": ["Hello"], "errors": [None], "pending": 1}
+        downloads = self.capture_downloads()
+        self.app.run()
+        self.assertIn("Hello", self.transcript_html())
+        self.assertIn("Streaming", self.rendered_text())
+        self.assertIn("incomplete", downloads[-1])
+        self.assertNotIn("Tencent", downloads[-1])
+        self.assertNotIn("Astra", downloads[-1])
+        self.app.button(key="stop_recording").click().run()
+        self.assertIn("English captions: Complete", downloads[-1])
+        self.load_transcriber.assert_not_called()
+        self.load_openai_transcriber.assert_not_called()
+        self.load_vad.assert_not_called()
+        self.make_translation.assert_not_called()
+        self.make_diarization.assert_not_called()
+        self.correct.assert_not_called()
+
+    def test_realtime_upload_bypasses_vad_and_never_retranslates_captions(self):
+        self.app.selectbox(key="upload_model_pair").set_value("gpt-realtime-translate").run()
+        segments = self.start_patch("src.uploads.speech_segments")
+        self.select_wav()
+        downloads = self.capture_downloads()
+        self.transcribe_file()
+        self.app.run()
+        self.assertEqual(self.app.session_state["upload_state"]["texts"], ["你好"])
+        self.assertEqual(self.app.session_state["upload_state"]["direct_translation"]["translations"], ["Hello."])
+        self.assertIn("gpt-realtime-translate", downloads[-1])
+        self.assertIn("Hello.", downloads[-1])
+        self.assertIn("English captions: Complete", downloads[-1])
+        self.assertNotIn("upload_job", self.app.session_state)
+        self.assertEqual(self.make_realtime.call_count, 1)
+        segments.assert_not_called()
+        self.load_vad.assert_not_called()
+        self.make_translation.assert_not_called()
+        self.make_diarization.assert_not_called()
+
+    def test_realtime_failure_retains_partial_english_and_exports_incomplete_status(self):
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-realtime-translate").run()
+        session = self.start_recording()
+        session.state.update(texts=["來源"], accepting=False, finished=True, error="Connection failed")
+        session.state["direct_translation"] = {"translations": ["Partial English."],
+                                                "errors": ["Connection failed"], "pending": 0}
+        downloads = self.capture_downloads()
+        self.app.run()
+        self.assertIn("Partial English.", downloads[-1])
+        self.assertIn("English captions: Incomplete", downloads[-1])
+        self.assertNotIn("retry_translation", [button.key for button in self.app.button])
+        self.assertFalse(self.app.button(key="start_recording").disabled)
+        self.make_translation.assert_not_called()
+
+    def test_switching_from_realtime_to_default_closes_old_stream(self):
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-realtime-translate").run()
+        old = self.start_recording()
+        self.app.button(key="stop_recording").click().run()
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-live-transcribe + gpt-6-luna").run()
+        self.start_recording()
+        old.close.assert_called_once()
+        self.assertNotIn("realtime_translation", self.app.session_state)
+        self.assertEqual(self.app.session_state["translation"].model, "gpt-6-luna")
+
+    def test_realtime_upload_can_be_stopped_and_retains_incomplete_download(self):
+        streaming = FakeRealtimeSession()
+        streaming.state.update(texts=["來源"], accepting=False)
+        streaming.state["direct_translation"] = {"translations": ["Partial English."], "errors": [None], "pending": 1}
+        streaming.start_file.side_effect = None
+        self.make_realtime.side_effect = None
+        self.make_realtime.return_value = streaming
+        self.app.selectbox(key="upload_model_pair").set_value("gpt-realtime-translate").run()
+        self.select_wav()
+        self.transcribe_file()
+        self.assertIn("upload_job", self.app.session_state)
+        self.assertTrue(self.app.selectbox(key="upload_model_pair").disabled)
+        downloads = self.capture_downloads()
+        self.app.button(key="stop_realtime_upload").click().run()
+        self.assertNotIn("upload_job", self.app.session_state)
+        streaming.close.assert_called_once()
+        self.assertIn("English captions: Incomplete", downloads[-1])
+
+    def test_openai_microphone_routes_audio_and_freezes_model_until_next_start(self):
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-live-transcribe + gpt-6-luna").run()
+        self.app.selectbox(key="microphone_translation_type").set_value("Fast English").run()
+        self.vad.side_effect = [{"start": 0}, None]
+        session = self.start_recording()
+        self.assertTrue(self.app.selectbox(key="microphone_model_pair").disabled)
+        self.assertTrue(self.app.selectbox(key="upload_model_pair").disabled)
+        frame = av.AudioFrame.from_ndarray(np.ones((1, 800), dtype=np.float32), format="fltp", layout="mono")
+        frame.sample_rate = 16_000
+        session.push(frame)
+        self.app.button(key="stop_recording").click().run()
+        session._worker.join(timeout=5)
+        downloads = self.capture_downloads()
+        self.app.run()
+        self.load_transcriber.assert_not_called()
+        self.cloud_transcribe.assert_called_once()
+        translation = self.app.session_state["translation"]
+        self.assertEqual(translation.model, "gpt-6-luna")
+        self.assertEqual(translation.sources, ["Cloud transcript"])
+        self.assertIn("OpenAI ASR · gpt-live-transcribe", self.transcript_html())
+        self.assertIn("Original transcript model: OpenAI ASR · gpt-live-transcribe", downloads[-1])
+        self.assertIn("gpt-live-transcribe + gpt-6-luna", downloads[-1])
+        self.app.selectbox(key="microphone_model_pair").set_value("Breeze + OpenAI").run()
+        self.assertEqual(self.app.session_state["translation_config"]["model_pair"],
+                         "gpt-live-transcribe + gpt-6-luna")
+        self.start_recording()
+        self.load_transcriber.assert_called_once_with()
+        self.assertIn("Breeze ASR · Local", self.transcript_html())
+        self.assertIsNone(self.app.session_state["translation"].model)
+        translation.close.assert_called_once()
+
+    def test_openai_upload_uses_own_model_choice_and_preserves_results_on_rerun(self):
+        self.app.selectbox(key="upload_model_pair").set_value("gpt-live-transcribe + gpt-6-luna").run()
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)] * 2)
+        self.cloud_transcribe.side_effect = ["First cloud line", "Second cloud line"]
+        self.select_wav()
+        self.transcribe_file()
+        self.app.run()
+        self.assertEqual(self.app.session_state["upload_state"]["texts"],
+                         ["First cloud line", "Second cloud line"])
+        self.load_transcriber.assert_not_called()
+        self.assertEqual(self.cloud_transcribe.call_count, 2)
+        self.assertEqual(self.app.session_state["translation"].model, "gpt-6-luna")
+        self.assertEqual(self.app.session_state["translation"].sources,
+                         self.app.session_state["tencent_translation"].sources)
+        self.assertIn("OpenAI ASR · gpt-live-transcribe", self.transcript_html())
+        self.app.selectbox(key="upload_model_pair").set_value("Breeze + OpenAI").run()
+        self.assertEqual(self.cloud_transcribe.call_count, 2)
+        self.assertEqual(self.app.session_state["translation_config"]["model_pair"],
+                         "gpt-live-transcribe + gpt-6-luna")
+        self.assertIn("OpenAI ASR · gpt-live-transcribe", self.transcript_html())
+
+    def test_failed_openai_upload_keeps_original_empty_without_using_breeze(self):
+        from src.openai_transcription import FAILED_MESSAGE, TranscriptionError
+
+        self.app.selectbox(key="upload_model_pair").set_value("gpt-live-transcribe + gpt-6-luna").run()
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(800, dtype=np.float32)])
+        self.cloud_transcribe.side_effect = TranscriptionError(FAILED_MESSAGE)
+        self.select_wav()
+        self.transcribe_file()
+        deadline = monotonic() + 3
+        while "upload_job" in self.app.session_state and monotonic() < deadline:
+            self.app.run()
+        state = self.app.session_state["upload_state"]
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["texts"], [])
+        self.assertIn(FAILED_MESSAGE, state["error"])
+        self.load_transcriber.assert_not_called()
+        self.assertIn("OpenAI ASR · gpt-live-transcribe", self.transcript_html())
+
+    def test_missing_openai_key_does_not_start_recording_or_load_breeze(self):
+        from src.openai_transcription import MISSING_KEY_MESSAGE, TranscriptionError
+
+        self.app.selectbox(key="microphone_model_pair").set_value("gpt-live-transcribe + gpt-6-luna").run()
+        self.load_openai_transcriber.side_effect = TranscriptionError(MISSING_KEY_MESSAGE)
+        self.app.button(key="start_recording").click().run()
+        self.assertIn(MISSING_KEY_MESSAGE, self.app.error[0].value)
+        self.assertNotIn("recording", self.app.session_state)
+        self.load_transcriber.assert_not_called()
 
     def test_fast_microphone_mode_creates_only_openai_and_stays_frozen(self):
         self.app.selectbox(key="microphone_translation_type").set_value("Fast English").run()
@@ -1565,6 +2009,60 @@ class RecordingAppTests(unittest.TestCase):
         self.assertEqual(len(self.review_requests(conversation=True)), 1)
         self.assertEqual(final["conversation_review"]["reviewed"], 1)
 
+    def test_upload_splits_speaker_turns_before_asr_and_preserves_offsets(self):
+        audio = np.zeros(32000, dtype=np.float32)
+        self.start_patch("src.uploads.speech_segments", return_value=[{
+            "audio": audio, "start_s": 10.0, "end_s": 12.0,
+        }])
+        self.diarization.snapshot.return_value = {
+            "status": "complete", "pending": 0, "error": None,
+            "processed_seconds": 12, "received_seconds": 12,
+            "segments": [
+                {"start_s": 10, "end_s": 11, "speaker_id": "Speaker 2"},
+                {"start_s": 11, "end_s": 12, "speaker_id": "Speaker 1"},
+            ],
+        }
+        self.transcribe.side_effect = ["First speaker.", "Second speaker."]
+        self.select_wav()
+        self.transcribe_file()
+        deadline = monotonic() + 5
+        while "upload_job" in self.app.session_state and monotonic() < deadline:
+            self.app.run()
+        self.assertEqual(len(self.app.exception), 0)
+        state = self.app.session_state["upload_state"]
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["texts"], ["First speaker.", "Second speaker."])
+        self.assertEqual([t["start_s"] for t in state["timings"]], [10, 11])
+        self.assertEqual([t["speaker_id"] for t in state["timings"]], ["Speaker 2", "Speaker 1"])
+        np.testing.assert_array_equal(np.concatenate([call.args[0] for call in self.transcribe.call_args_list]), audio)
+        self.assertTrue(all("_turns_prepared" not in t for t in state["timings"]))
+
+    def test_local_asr_loading_does_not_hold_the_upload_render_thread(self):
+        entered, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def load():
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("Model loading was not released.")
+            return self.transcribe
+
+        self.load_transcriber.side_effect = load
+        self.start_patch("src.uploads.speech_segments", return_value=[np.zeros(1600, dtype=np.float32)])
+        self.select_wav()
+        self.app.button(key="transcribe_file").click().run(timeout=3)
+        self.assertTrue(entered.wait(1))
+        self.assertFalse(self.app.session_state["upload_job"]["asr_task"].done())
+        self.assertEqual(len(self.app.exception), 0)
+        self.assertTrue(any("Tencent · Local" in item.value for item in self.app.caption))
+        release.set()
+        deadline = monotonic() + 5
+        while "upload_job" in self.app.session_state and monotonic() < deadline:
+            self.app.run()
+        self.assertTrue(self.app.session_state["upload_state"]["finished"])
+        self.assertIsNone(self.app.session_state["upload_state"]["error"])
+
     def test_completed_fast_draft_is_rendered_and_reviewed_while_next_asr_is_blocked(self):
         from src.ui import render_transcript
 
@@ -1590,7 +2088,7 @@ class RecordingAppTests(unittest.TestCase):
 
         def observe_render(texts, *args, **kwargs):
             nonlocal interrupted, pending_task_id
-            if second_started.is_set() and not interrupted:
+            if second_started.is_set() and not interrupted and st.session_state.get("upload_job"):
                 interrupted = True
                 job = st.session_state.upload_job
                 pending_task_id = id(job["asr_task"])
@@ -1599,6 +2097,7 @@ class RecordingAppTests(unittest.TestCase):
                 st.rerun()
             slow = kwargs.get("slow_lane", {})
             if (second_started.is_set() and not release.is_set() and texts == ["First original."]
+                    and st.session_state.get("upload_job")
                     and args[0][0] == "Fast English arrived."
                     and slow.get("translations") == ["Fast English arrived."] and self.correct.call_count):
                 job = st.session_state.upload_job
@@ -1614,12 +2113,16 @@ class RecordingAppTests(unittest.TestCase):
         self.start_patch("src.ui.render_transcript", side_effect=observe_render)
         self.select_wav()
         self.app.button(key="transcribe_file").click().run(timeout=8)
+        deadline = monotonic() + 6
+        while "upload_job" in self.app.session_state and monotonic() < deadline:
+            self.app.run(timeout=8)
+            sleep(0.01)
 
         self.assertEqual(len(self.app.exception), 0)
         self.assertTrue(interrupted)
-        self.assertTrue(rendered_while_blocked.is_set())
         state = self.app.session_state["upload_state"]
         self.assertIsNone(state["error"])
+        self.assertTrue(rendered_while_blocked.is_set())
         self.assertEqual(state["texts"], ["First original.", "Second original."])
         self.assertEqual(calls, 2)
         self.assertIn("Fast English arrived.", self.transcript_html())

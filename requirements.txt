@@ -19,6 +19,7 @@ streamlit-webrtc==0.64.5
 # API translation and configuration
 python-dotenv
 openai==3.24.0
+websockets==17.2
 
 # Reference parsing and transcription evaluation
 jiwer==4.0.0

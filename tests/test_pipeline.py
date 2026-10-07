@@ -37,6 +37,22 @@ class ScriptedVAD:
 
 
 class LiveTranscriberTests(unittest.TestCase):
+    def test_speaker_turns_are_transcribed_separately_without_losing_audio(self):
+        speakers = Mock()
+        speakers.snapshot.return_value = {"status": "complete", "segments": [
+            {"start_s": 0, "end_s": 1, "speaker_id": "Speaker 1"},
+            {"start_s": 1, "end_s": 2, "speaker_id": "Speaker 2"},
+        ]}
+        vad = ScriptedVAD({1: {"start": 0}})
+        pipeline = self.make_pipeline(vad, diarization=speakers)
+        audio = np.arange(32000, dtype=np.float32) / 32000
+        pipeline.push(audio_frame(audio))
+        self.finish(pipeline)
+        state = pipeline.snapshot()
+        self.assertEqual(state["texts"], ["segment 1", "segment 2"])
+        self.assertEqual([t["speaker_id"] for t in state["timings"]], ["Speaker 1", "Speaker 2"])
+        np.testing.assert_array_equal(np.concatenate(self.segments), audio)
+
     def setUp(self):
         self.segments = []
 

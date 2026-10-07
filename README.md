@@ -1,9 +1,13 @@
-# Breeze Voice transcription and translation
+# Voice transcription and translation
 
-A local Streamlit app for browser microphone recording and WAV uploads. It uses
-Silero VAD to split speech and transcribes each segment with the existing
-`Models/breeze-asr-26` model. Breeze-ASR-26 targets Taiwanese Hokkien and outputs
-Chinese characters. Each completed segment is translated into English independently:
+A Streamlit app for browser microphone recording and WAV uploads. The default
+model pair is **gpt-live-transcribe + gpt-6-luna**: Silero VAD splits speech locally,
+OpenAI transcribes the audio, and Luna translates the completed transcript.
+Both **Microphone** and **Upload WAV** have a **Transcription + translation model**
+dropdown with **Breeze + OpenAI** and **gpt-realtime-translate** as alternatives.
+All options produce English translations. Breeze-ASR-26 transcribes
+Taiwanese Hokkien locally from `Models/breeze-asr-26` into Chinese characters.
+Each completed segment is translated into English independently:
 by OpenAI through its API and by [Tencent Hy-MT2-1.8B](https://huggingface.co/tencent/Hy-MT2-1.8B)
 running on this computer. A fourth model column defaults to **GPT-6 Astra, medium
 reasoning**, to improve the English draft and repair likely transcription errors
@@ -20,15 +24,51 @@ earlier rows and updates the same Astra cell as soon as it finishes.
 | Model | Role in this app | Input → output | Where it runs |
 | --- | --- | --- | --- |
 | **Silero VAD** (`silero-vad`) | Detects speech boundaries before transcription. | Mono 16 kHz audio → speech segments | Locally on CPU, loaded through the Python package. |
+| **GPT Live Transcribe** (`gpt-live-transcribe`) | Default speech recognition for microphone and uploads. | Speech segments → original-language transcript | OpenAI Realtime API; requires `OPENAI_API_KEY`. |
+| **GPT Realtime Translate** (`gpt-realtime-translate`) | Optional direct audio-to-English streaming captions. | Continuous audio → English captions, alongside separate source captions | OpenAI's dedicated translation endpoint; source captions use `gpt-realtime-whisper`. |
+| **GPT-4o Mini TTS / TTS-1 HD** (`gpt-4o-mini-tts`, `tts-1-hd`) | Optional spoken English during microphone/upload translation. | Accepted Astra corrections (or English output in modes without Astra) → streaming speech | OpenAI Speech API; browser playback with preset speaker voices. |
 | **Breeze-ASR-26** (`MediaTek-Research/Breeze-ASR-26`) | Transcribes Taiwanese Hokkien speech. | Speech segments → Chinese-character transcript | Locally from `Models/breeze-asr-26/`, using Apple MPS when available or CPU. |
 | **OpenAI translation model** (code default: `gpt-6-luna`) | Translates each completed transcript segment into English through the Responses API. | Transcript text → English translation | OpenAI API; configurable with `OPENAI_DEFAULT_MODEL` and `OPENAI_DEFAULT_REASONING_EFFORT`. Requires `OPENAI_API_KEY`. |
 | **Tencent Hy-MT2-1.8B** (`tencent/Hy-MT2-1.8B`) | Provides an independent local English translation of the same transcript. | Transcript text → English translation | Locally from `Models/Hy-MT2-1.8B/`, using Apple MPS when available or CPU. |
 | **Astra correction model** (default: `gpt-6-astra`, medium reasoning) | Repairs supported transcription/translation mistakes and produces coherent English using nearby conversation. | Noisy source transcript, draft, and neighboring utterances → reviewed English | OpenAI API; configurable with `OPENAI_CORRECTION_MODEL` and `OPENAI_CORRECTION_REASONING_EFFORT`. |
 
-The processing order is **audio → Silero VAD → Breeze-ASR-26 → OpenAI and
-Tencent translations**. Both translators receive the original Breeze transcript;
-neither uses the other translator's output. Audio stays local, and only transcript
-text is sent to OpenAI. Evaluation references stay local and are never model inputs.
+The processing order is **audio → Silero VAD → selected transcriber → OpenAI and
+Tencent translations**. Both translators receive the same original transcript.
+The **Original transcript** column identifies its ASR provider and model. In the
+default mode it displays the final **OpenAI ASR · gpt-live-transcribe** result;
+OpenAI transcription errors never fall back to Breeze. The label stays tied to
+the conversation that produced the text, including in TXT downloads, even after
+changing the model dropdown for a future conversation.
+With the default pair, audio is sent to OpenAI. **Breeze + OpenAI** keeps audio
+local and sends transcript text for translation. Evaluation references stay local
+and are never model inputs. Evaluation retains its Breeze baseline.
+
+[`src/openai_transcription.py`](src/openai_transcription.py) uses the
+[Realtime transcription protocol](https://developers.openai.com/api/docs/guides/realtime-transcription),
+including 24 kHz PCM conversion, client-side speech boundaries, and explicit commits.
+Uploads use the same segment adapter to keep the requested `gpt-live-transcribe`
+model. Each segment owns a connection with a 45-second response deadline and no
+automatic retries. Only committed final transcripts are displayed and translated;
+this app still waits for utterance boundaries rather than displaying partial words.
+
+**gpt-realtime-translate** uses a separate continuous streaming path in
+[`src/realtime_translation.py`](src/realtime_translation.py). It streams microphone
+audio immediately, including silence, and displays English caption fragments as
+they arrive. The output language is fixed to `en`. Uploads stream at playback speed
+with progress and a **Stop file translation** button. The
+[translation API](https://developers.openai.com/api/docs/guides/realtime-translation)
+translates audio directly; Luna, Tencent, Astra, glossary filtering and local
+speaker detection do not run in this mode. The microphone **Translation type**
+control is disabled for it. Its native speech audio is discarded; optional spoken
+English uses the separately selected text-to-speech model below.
+
+Source and English captions appear as two continuous texts because their fragment
+boundaries need not match. **Stop recording** flushes remaining audio and waits for
+the service's `session.closed` event; a failed or manually stopped upload retains
+available captions with an **Incomplete** label in the UI and TXT export. There is
+no automatic reconnect or retry. A missing English result is marked unavailable;
+source text is never substituted as a translation. The default pair above remains
+selected when opening either input.
 
 Prepare Breeze with [`Notebooks/01 Download Assets.ipynb`](Notebooks/01%20Download%20Assets.ipynb)
 and Tencent with [`scripts/download_tencent.py`](scripts/download_tencent.py),
@@ -53,12 +93,13 @@ python -m streamlit run app.py --server.address localhost
 ```
 
 Open <http://localhost:8501>, click **Start recording**, and allow microphone
-access. The first start loads the local models; later recordings reuse Breeze.
+access. The default pair needs OpenAI API access and no Breeze weights. Selecting
+Breeze loads its local model on first use and reuses it for later recordings.
 Text is appended after roughly half a second of silence plus inference time.
 **Stop recording** submits any unfinished speech and finishes waiting segments.
-The next Start clears the conversation. Audio stays on this Mac; completed
-transcript and configured terminology are sent to OpenAI for translation and
-correction. Conversation text, timings, and correction history stay in memory
+The next Start clears the conversation. The default pair sends speech audio to
+OpenAI; completed transcript and configured terminology are sent for translation
+and correction. Conversation text, timings, and correction history stay in memory
 until the next session; downloads save a copy. Processed audio is released as
 each worker finishes using it.
 
@@ -73,34 +114,41 @@ again. Before starting, open **Microphone settings → Translation type**:
 | **Corrected English** | OpenAI translation followed by independent Astra corrections. |
 | **Fully reviewed English** | OpenAI translation, independent Astra corrections, then sequential conversation review. |
 
-The selection applies to the next recording and stays fixed while it runs.
+The model pair and translation type apply to the next recording and stay fixed
+while it runs. Each input has its own model choice. Completed results and exports
+retain the model pair used, even after changing the next session's dropdown.
 Only selected providers run or appear in the transcript; Astra modes also show
 their fast OpenAI draft. Choosing a mode without Tencent avoids loading that
 translator for the recording. Upload and evaluation keep the full comparison
-workflow independently of the microphone selection. All modes output English.
+workflow independently of the microphone selection, except for the standalone
+realtime translation option described above. All modes output English.
 The **Astra corrections** switch pauses both review passes for modes that use them.
 The browser device picker appears in **Microphone settings** once recording has
 started. The workspace uses a light theme and stacks its panels on narrow screens.
 
 ### Upload a WAV file
 
-Choose **Upload WAV**, select a `.wav` file, optionally play it back, then click
+Choose **Upload WAV**, select the model pair and a `.wav` file, optionally play it back, then click
 **Transcribe file**. Mono and stereo WAV files are converted to mono 16 kHz.
-Silero finds speech, and Breeze transcribes each segment in order. Progress and
+For the transcription-plus-translation options, Silero finds speech and the selected
+model transcribes each segment in order. Realtime translation instead streams the
+complete audio without VAD cuts. Progress and
 numbered text appear as segments finish; each translation follows independently.
 Use **Download conversation** to save all four model columns and speaker labels.
 Selecting a file alone does not start transcription. Each new transcription
 replaces the displayed text. Stop any live recording and let its pending segments
-finish before uploading. Files are processed in memory on this Mac. WAV decoding
+finish before uploading. Files are decoded in memory on this Mac; the OpenAI pair
+sends speech segments to OpenAI for transcription. WAV decoding
 reads at most 65,536 source frames at a time, averaging channels into one mono
 buffer before resampling. The upload job keeps decoded audio across UI reruns,
 then releases it on completion or failure; speaker detection owns a separate
 copy until it finishes. The selected WAV remains available for playback and retry.
 
 If creating an environment from scratch, run `python3 -m venv .venv` first.
-The model and processor must already be present in `Models/breeze-asr-26`;
-the app uses local files and needs no Hugging Face token. The existing download
-notebook can prepare the model when needed.
+For **Breeze + OpenAI** and evaluation, the model and processor must already be
+present in `Models/breeze-asr-26`; loading uses local files and needs no Hugging Face
+token. The existing download notebook can prepare the model when needed. Tencent
+and Nemotron assets are still needed when their comparison/speaker options are enabled.
 
 ### Evaluate against a reference
 
@@ -201,8 +249,10 @@ DNT_FILE=
 HF_TOKEN=
 ```
 
-`OPENAI_DEFAULT_MODEL` selects the fast translator, and
-`OPENAI_DEFAULT_REASONING_EFFORT` explicitly sets its reasoning effort. With the
+`OPENAI_DEFAULT_MODEL` selects the fast translator for **Breeze + OpenAI** and
+evaluation. The default **gpt-live-transcribe + gpt-6-luna** pair pins translation
+to `gpt-6-luna`, regardless of that environment override.
+`OPENAI_DEFAULT_REASONING_EFFORT` explicitly sets fast translation's reasoning effort. With the
 effort missing or blank, this app uses `none` for `gpt-6-luna` and omits the
 reasoning option for other models so the provider selects its default. Luna
 supports `none`, `low`, `medium`, `high`, `xhigh`, and `max`; see the
@@ -225,7 +275,10 @@ decoding and an English-only prompt. Truncated, empty, or repeatedly invalid
 output remains a visible failure rather than a partial translation.
 
 `OPENAI_CORRECTION_MODEL` and `OPENAI_CORRECTION_REASONING_EFFORT` independently
-select the model and reasoning effort for both passes in the Astra correction column.
+select the model and default reasoning effort for both passes in the Astra correction column.
+With speech enabled, **Live corrections** uses Low reasoning for the first
+`gpt-6-astra` pass; the background conversation pass retains this configured effort.
+Other correction models retain their configured effort in both passes.
 `OPENAI_CORRECTION_MAX_OUTPUT_TOKENS` sets the initial combined reasoning and
 translation-response token cap, including structured output. It defaults to
 16,384 and accepts integers from 512 through 16,384; explicitly configured smaller
@@ -248,8 +301,10 @@ outputs. Invalid effort names produce a configuration error. Model compatibility
 and API access are checked by the provider when a request runs.
 
 The key stays on the server. Transcript text, recent translations, and configured
-glossary/DNT context are sent to the official OpenAI Responses API; audio and
-evaluation references are never uploaded to OpenAI. Requests use `store=False`.
+glossary/DNT context are sent to the official OpenAI Responses API with `store=False`.
+The default transcriber and realtime translation option also send audio through OpenAI's Realtime API; that
+protocol has no Responses `store` parameter. Breeze and evaluation keep audio
+local. Evaluation references are never uploaded to OpenAI.
 Translation needs internet access and uses your API account. Restart Streamlit
 after changing `.env` credentials, model, or reasoning settings.
 
@@ -318,8 +373,9 @@ appear immediately even when conversation review is waiting on an earlier row.
 
 A failed conversation review keeps the last accepted English visible and pauses
 the dependent sequential work until retry. Filtered background rows need no
-second request. Both passes use the same configured model, reasoning effort,
-token cap, and validation; neither has a timeout. The status and audit distinguish
+second request. Both passes use the same configured model, token cap, and
+validation; neither has a timeout. Their reasoning effort is normally the same,
+except for the **Live corrections** speech option described below. The status and audit distinguish
 the two passes. Downloads use the newest accepted wording and retain review
 status rather than treating pending work as fully reviewed.
 
@@ -350,11 +406,20 @@ separate from Breeze/Tencent's shared Metal lock.
 **Nemotron speaker detection** enables diarization for the next recording/upload.
 Continuous audio, including silence, feeds a persistent streaming speaker cache;
 labels such as `Speaker 1` follow audio-time overlap with each ASR segment.
-Up to eight anonymous speakers are supported. A segment spanning multiple
-speakers keeps a combined label; the app does not split or identify people from
-their voices. Missing weights or a full speaker queue show a status message while
-transcription continues. Speaker accuracy and real-time speed depend on the audio
-and hardware; they are not established by unit tests.
+Up to eight anonymous speakers are supported. Before transcription, clear sequential
+speaker changes split a VAD segment into separate rows. The cuts preserve every
+audio sample and its absolute timestamp; brief activity flicker does not create
+tiny requests. Substantial simultaneous speech keeps a combined label. These are
+session-local speaker numbers, not people identified by their voices.
+
+The upload worker waits up to 30 seconds for speaker timing, including cold model
+loading; the microphone ASR worker waits up to 3 seconds. Capture and rendering
+continue during those waits. If timing is still unavailable, transcription proceeds
+with the original segment and labels can arrive later. Labels are only published
+when the corresponding audio interval has been processed. The UI shows processed
+audio seconds and total received seconds, including silence. Missing weights or a
+full speaker queue show a status message while transcription continues. Accuracy
+and real-time speed depend on the audio and hardware.
 
 ### Local Tencent configuration
 
@@ -370,6 +435,14 @@ downloaded files and runs entirely locally: it sends neither audio nor transcrip
 text to Tencent or Hugging Face. The model receives the same Chinese-character
 transcript as OpenAI, rather than OpenAI's translated text.
 
+The UI reports model loading/readiness, the active row, queued rows, and elapsed
+time during uploads as well as after transcription. Generation has a 60-second
+limit per attempt, checked between decoding steps, and a 512-token output cap.
+Incomplete output fails that row and allows the queue to continue. A new session
+cancels old local generation between steps; model loading and a running device
+operation must finish before cancellation takes effect. Single-row generation is
+retained: CPU tests on this Mac found two-row batching slower.
+
 ### Comparing results and retrying
 
 Speech recognition, OpenAI translation, and Tencent translation have separate
@@ -377,6 +450,12 @@ workers. One translator can finish even if the other is slow or unavailable.
 The two local models share an execution lock: overlapping Breeze and Tencent
 GPU calls caused a native Metal crash during testing. Model work takes turns;
 microphone capture, VAD, and OpenAI requests continue independently.
+Uploads keep both ASR model loading and inference in a reusable background task.
+The Streamlit fragment returns while work is pending and polls every 0.5 seconds,
+so accepted translations and corrections remain visible while subsequent audio
+or speaker timing is being processed. Restart Streamlit after Python changes;
+file watching is disabled. Keep one app process running to avoid duplicate model
+copies consuming local memory.
 Each source segment is submitted once to each provider per conversation, including
 across UI refreshes. **Retry OpenAI** and **Retry Tencent · Local** retry only the
 failed segments for that provider; completed results remain visible.
@@ -405,6 +484,7 @@ An already running translation may finish, but cannot populate the new conversat
   English columns; `openpyxl` reads workbooks in read-only mode.
 - `src/translation.py` provides the OpenAI request and reusable translation queue;
   the app creates one queue for each provider.
+- `src/openai_transcription.py` provides the default cloud speech adapter for both inputs.
 - `src/slow_lane.py` owns versioned subtitles, correction windows, and sealing;
   `src/reasoning.py` calls Astra with a strict correction schema.
 - `src/glossary.py` handles local terminology, DNT checks, and session learning.
@@ -439,10 +519,111 @@ WebRTC 0.78.1 repeatedly reset the microphone connection during testing.
 File watching is disabled to avoid scanning Transformers' lazy imports.
 Restart Streamlit after editing Python files.
 
+### Read English aloud while translating
+
+In **Microphone** or **Upload WAV**, turn on **Read English aloud** before starting.
+The **Text-to-speech model** dropdown offers **gpt-4o-mini-tts** (default) and
+**tts-1-hd** for both microphone and uploaded audio. Both use the same English
+text, speaker mapping, streaming player, and initial delay. `tts-1-hd` is the
+HD speech option; it does not accept the extra delivery instructions used by
+`gpt-4o-mini-tts`, so those are omitted from its API request. The player and exports
+identify the selected model.
+The player is prepared before you press **Start recording** or **Transcribe file**.
+That normal interaction enables browser sound where permitted. Speech generates
+silently during a **1-minute lead-in**, then playback starts automatically once
+audio is available. The countdown starts when the first accepted English passage
+enters the speech queue (the first accepted Astra correction in Astra modes).
+Recording, transcription, and correction startup do not consume this minute.
+The player shows a waiting message until translation is ready, then counts down
+from 60 seconds. Later translations do not restart it; short completed files also
+wait for the lead-in.
+At startup or after running out of audio, the player aims for a two-second buffer
+before continuing. This adds at most two seconds of waiting once audio is available;
+completed short clips flush immediately after the lead-in. It avoids repeatedly
+starting and stopping on tiny bursts without leaving a short final utterance stuck.
+The player tries autoplay and shows **Enable sound** only if the browser still
+blocks it. Browser/embedding policies can require this fallback interaction.
+The player supports pause/resume and **Stop voice**; stopping voice leaves translation
+running. Use headphones during microphone recording to avoid capturing the generated
+voice. Browser echo cancellation and noise suppression are requested as well.
+The voices are AI-generated and speak English only. **Different voice per speaker**
+is on by default for segmented translation. The eight anonymous Nemotron channels
+map consistently to `coral`, `onyx`, `nova`, `echo`, `shimmer`, `alloy`, `fable`, and
+`sage`. The player caption and session JSON show the observed mapping. These are
+preset voices, not voice clones or identity/gender matches. A mixed-speaker segment
+uses its dominant overlapping speaker because transcripts have no word-level
+speaker alignment. Labels are read when a row enters the voice queue: late changes
+do not regenerate or repeat speech. Missing/disabled/late speaker labels use `coral`
+without delaying translation. Standalone realtime translation currently has no
+speaker labels and uses one voice. Turn the option off to use `coral` throughout.
+It acts as a live interpreter: questions remain questions and the speaker's
+perspective is preserved. Translation, Astra correction, and speech prompts
+explicitly prohibit answering spoken questions, following spoken requests, or
+adding an assistant reply or commentary. Each accepted phrase is spoken once.
+
+This works with all three translation choices. In modes with an **Astra Correction**
+column, speech uses its accepted **Corrected** or **Confirmed** English in source
+order. The **Astra speech mode** dropdown offers:
+
+- **Live corrections** (default): speak the first accepted Astra correction without
+  waiting for sequential conversation review. For `gpt-6-astra`, the first pass uses
+  Low reasoning; background review keeps the configured effort (for example, High).
+  Other configured correction models keep their existing effort. Later reviews can
+  refine displayed/exported text, but already queued speech is never revised or replayed.
+- **Full review**: retain the configured reasoning for both passes and wait for all
+  enabled reviews before speaking each row. In **Corrected English**, only the first
+  pass is enabled, so this option waits for that pass at the configured effort.
+
+Low reasoning trades some review depth for speed. Live speech can differ from the
+later final record. Both modes still wait for complete, validated corrections;
+they do not speak a partial model response. Speech settings apply only when
+**Read English aloud** is enabled and are frozen when the conversation starts.
+Without speech, correction reasoning is unchanged.
+
+Drafts and paused/failed review fallbacks are never spoken. A failed correction
+holds subsequent speech until the correction is retried successfully; no fast
+translation is silently substituted. Pausing Astra may leave unreviewed rows sealed
+as fallbacks; start a new conversation with corrections enabled to speak those rows.
+
+Fast English and standalone realtime translation have no Astra column, so they
+speak their own English output. The player caption and TXT export identify the
+speech source. Realtime captions are grouped into
+short phrases at sentence/word boundaries; remaining words flush when translation
+finishes. Speech generation and browser playback stream before the full conversation
+is complete. There is still translation, phrase-buffering, API and playback latency.
+Tencent output, unreviewed drafts in Astra modes, failed/filtered English,
+original-language text and evaluation references are never read aloud. Accepted
+rows are queued only once across refreshes. Settings are frozen for each conversation; the next recording
+or file cancels old voice work and clears its playback queue. Evaluation has no speech
+option.
+
+[`src/speech.py`](src/speech.py) uses OpenAI's
+[streaming Speech API](https://developers.openai.com/api/docs/guides/text-to-speech)
+with server-side credentials and 24 kHz PCM16. The persistent browser player in
+`src/speech_player/` uses one Web Audio clock to schedule ready chunks contiguously,
+deduplicates refreshes, and acknowledges played chunks so the server releases them.
+Up to two TTS requests run ahead, but their PCM is released strictly in phrase order.
+Each in-flight request buffers at most two seconds; the published audio queue is
+capped at 60 seconds, and
+queued text at 20,000 characters. Playback backpressure does not block transcription
+or translation. Short sentences within the same accepted speaker row are grouped
+into passages of up to 300 characters; separate speaker rows stay separate.
+`src/speech_audio.py` removes excess near-silent padding at each request boundary,
+retaining 80 ms before and 120 ms after speech. Audible samples and internal pauses
+remain unchanged. Its conservative -54 dBFS threshold and bounded two-second
+lookbehind limit how much silence is removed; this is not time compression.
+The browser joins ready chunks on the same audio clock and rebuilds a small buffer
+after an underrun. Voice failures are reported separately without automatic retries;
+start a new conversation to retry. This adds speech API usage to your OpenAI account.
+The initial lead-in reduces interruptions; it cannot guarantee uninterrupted speech
+if recognition, correction, or TTS consistently falls behind playback.
+No new Python dependency is required.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
+node --test tests/test_speech_player.js
 ```
 
 Tests exercise audio resampling, WAV validation, recording and upload lifecycles,

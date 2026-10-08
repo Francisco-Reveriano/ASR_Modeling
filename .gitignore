@@ -12,3 +12,7 @@ __pycache__/
 /Models/
 /Data/
 .streamlit/secrets.toml
+node_modules/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo

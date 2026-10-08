@@ -1,6 +1,7 @@
 # Voice transcription and translation
 
-A Streamlit app for browser microphone recording and WAV uploads. The default
+A local React + TypeScript frontend and FastAPI server for browser microphone
+recording, WAV uploads, and evaluation. The default
 model pair is **gpt-live-transcribe + gpt-6-luna**: Silero VAD splits speech locally,
 OpenAI transcribes the audio, and Luna translates the completed transcript.
 Both **Microphone** and **Upload WAV** have a **Transcription + translation model**
@@ -89,23 +90,27 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python scripts/download_tencent.py
 python scripts/download_diarization.py
-python -m streamlit run app.py --server.address localhost
+npm --prefix frontend ci
+npm --prefix frontend run build
+python -m server
 ```
 
-Open <http://localhost:8501>, click **Start recording**, and allow microphone
+Open <http://localhost:8000>, click **Start subtitles**, and allow microphone
 access. The default pair needs OpenAI API access and no Breeze weights. Selecting
 Breeze loads its local model on first use and reuses it for later recordings.
 Text is appended after roughly half a second of silence plus inference time.
 **Stop recording** submits any unfinished speech and finishes waiting segments.
-The next Start clears the conversation. The default pair sends speech audio to
+**Stop** drains accepted work and keeps results for review/export. **End and clear**
+removes the session and releases its buffers. The next Start replaces the conversation
+after the new input is validated. The default pair sends speech audio to
 OpenAI; completed transcript and configured terminology are sent for translation
 and correction. Conversation text, timings, and correction history stay in memory
-until the next session; downloads save a copy. Processed audio is released as
+until explicitly cleared or disconnected for 30 minutes; downloads save a copy. Processed audio is released as
 each worker finishes using it.
 
 The conversation view numbers each completed speech segment (`01`, `02`, …).
-Use **Download conversation** to save all model results before starting
-again. Before starting, open **Microphone settings → Translation type**:
+Use **Export → TXT** to save all model results before starting
+again. Before starting, open **Models & translation settings → Translation type**:
 
 | Type | Processing |
 | --- | --- |
@@ -123,8 +128,28 @@ translator for the recording. Upload and evaluation keep the full comparison
 workflow independently of the microphone selection, except for the standalone
 realtime translation option described above. All modes output English.
 The **Astra corrections** switch pauses both review passes for modes that use them.
-The browser device picker appears in **Microphone settings** once recording has
-started. The workspace uses a light theme and stacks its panels on narrow screens.
+The microphone device picker is available in input settings; browsers may reveal
+device names only after granting microphone permission. The workspace uses a light theme and stacks its panels on narrow screens.
+
+### React workspace and development
+
+The main screen starts subtitles with deployment defaults. English stays primary;
+**Show original** adds the matching source beneath each segment. The latest three
+turns form the subtitle view, with complete transcript, comparison and history views
+below. Text size, subtitle position and source visibility persist as presentation
+preferences only. Hiding subtitles does not end recording.
+
+The persistent processing indicator names the active local/OpenAI route. This local
+release deliberately retains external OpenAI inference and optional spoken output,
+so it does not claim the private, text-only production boundary of TRS-LT-001-S1.
+See [the migration and API notes](docs/react-fastapi-migration.md) and
+[the runtime validation record](docs/react-runtime-validation.md).
+
+For frontend development, keep `python -m server` running and, in another terminal,
+run `npm --prefix frontend run dev`. Open <http://localhost:5173>; Vite proxies HTTP
+and WebSockets to FastAPI. Normal use serves the built frontend directly from port
+8000. Node.js 22.12 or newer is needed to install/build the frontend; Node is not
+needed to serve an existing build. Install `requirements-dev.txt` for Python tests.
 
 ### Upload a WAV file
 
@@ -134,13 +159,13 @@ For the transcription-plus-translation options, Silero finds speech and the sele
 model transcribes each segment in order. Realtime translation instead streams the
 complete audio without VAD cuts. Progress and
 numbered text appear as segments finish; each translation follows independently.
-Use **Download conversation** to save all four model columns and speaker labels.
+Use **Export → TXT** to save all four model columns and speaker labels.
 Selecting a file alone does not start transcription. Each new transcription
 replaces the displayed text. Stop any live recording and let its pending segments
 finish before uploading. Files are decoded in memory on this Mac; the OpenAI pair
 sends speech segments to OpenAI for transcription. WAV decoding
 reads at most 65,536 source frames at a time, averaging channels into one mono
-buffer before resampling. The upload job keeps decoded audio across UI reruns,
+buffer before resampling. The server-owned upload worker keeps decoded audio while it processes the file,
 then releases it on completion or failure; speaker detection owns a separate
 copy until it finishes. The selected WAV remains available for playback and retry.
 
@@ -289,7 +314,7 @@ show the configured settings, and **Reasoning + output token cap** can override 
 environment default for the next session.
 
 Leave the two terminology paths empty when unused. Confidence and
-speaker/correction toggles are configured in Streamlit.
+speaker/correction toggles are configured in the React frontend.
 Astra corrections have no automatic timeout or expiry setting.
 `VOG_RECONCILIATION_REASONING_EFFORT` is not read by this app; use
 `OPENAI_DEFAULT_REASONING_EFFORT` for fast translation instead.
@@ -305,7 +330,7 @@ glossary/DNT context are sent to the official OpenAI Responses API with `store=F
 The default transcriber and realtime translation option also send audio through OpenAI's Realtime API; that
 protocol has no Responses `store` parameter. Breeze and evaluation keep audio
 local. Evaluation references are never uploaded to OpenAI.
-Translation needs internet access and uses your API account. Restart Streamlit
+Translation needs internet access and uses your API account. Restart the FastAPI server
 after changing `.env` credentials, model, or reasoning settings.
 
 This cloud-backed configuration does not meet the supplied TRS's on-premises-only
@@ -314,8 +339,9 @@ app is not a production compliance claim.
 
 ### Astra corrections and terminology
 
-In the left pane, expand **Translation & speaker settings** to pause corrections, select
-**Live subtitles** or **Final record**, and configure the next session. Astra uses
+Open **Models & translation settings** to configure the next session. The workspace shows live
+subtitles, the complete transcript, provider comparisons and correction history.
+Accepted Astra corrections update the same segment; final caption exports use sealed text. Astra uses
 `gpt-6-astra` with medium reasoning and confidence ≥0.6 by default. Each completed
 fast translation starts its own Astra review. Reviews run in parallel, and each
 accepted result appears immediately even if an earlier segment is still being
@@ -357,9 +383,10 @@ retry allowance per segment. Truncated partial output is never accepted. Other
 provider errors require manual retry. A slow or failed first review never holds back
 another segment's completed first correction. Persistent failures show a specific
 safe reason and remain available for manual retry. Starting a new conversation
-cancels pending reviews. The **Correction
-history & session export** panel provides JSON audit history, final bilingual CSV,
-and SRT/VTT with actual audio offsets.
+cancels pending reviews. **Correction history & processing details** shows audit
+history. The **Export** menu provides session JSON, final bilingual CSV,
+and SRT/VTT with actual audio offsets. Standalone realtime translation offers TXT
+and JSON because its source and English caption fragments do not align.
 
 **Conversation review** is the second pass, enabled for full comparison and
 fully reviewed microphone recordings. It reviews one row at a time in transcript
@@ -396,6 +423,11 @@ streaming ASR partials, LocalAgreement stabilization, durable reconnects, or the
 TRS latency/capacity guarantees.
 
 ### Local speaker diarization
+
+Open [the HTML diarization guide](docs/diarization-explainer.html) in a browser for
+an interactive view of Silero frames, Nemotron's exact window sizes, speaker-turn
+splitting, and copyable Python examples. The guide runs offline and its controls
+do not change the app's configuration.
 
 `python scripts/download_diarization.py` downloads the pinned
 [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization)
@@ -450,12 +482,11 @@ workers. One translator can finish even if the other is slow or unavailable.
 The two local models share an execution lock: overlapping Breeze and Tencent
 GPU calls caused a native Metal crash during testing. Model work takes turns;
 microphone capture, VAD, and OpenAI requests continue independently.
-Uploads keep both ASR model loading and inference in a reusable background task.
-The Streamlit fragment returns while work is pending and polls every 0.5 seconds,
-so accepted translations and corrections remain visible while subsequent audio
-or speaker timing is being processed. Restart Streamlit after Python changes;
-file watching is disabled. Keep one app process running to avoid duplicate model
-copies consuming local memory.
+A server-owned coordinator advances uploads, translations, corrections, speaker
+metadata and speech independently of browser rendering. WebSocket subscribers receive
+an initial snapshot and changed segment/status updates; reconnecting never repeats
+inference. Keep one server process and one Uvicorn worker so model caches and GPU
+locks are shared. Restart the Python server after backend changes.
 Each source segment is submitted once to each provider per conversation, including
 across UI refreshes. **Retry OpenAI** and **Retry Tencent · Local** retry only the
 failed segments for that provider; completed results remain visible.
@@ -475,9 +506,11 @@ An already running translation may finish, but cannot populate the new conversat
 
 ## How it works
 
-- `app.py` handles microphone controls, model caching, and transcript updates.
-- `src/ui.py` renders and exports aligned source/OpenAI/Tencent/Astra rows;
-  `assets/style.css` styles the responsive workspace.
+- `frontend/` owns the React workspace, presentation preferences, browser microphone
+  capture, and PCM speech scheduling.
+- `server/` owns typed HTTP/WebSocket inputs, reference previews, session orchestration,
+  model caches, lifecycle cleanup and exports.
+- `src/ui.py` retains pure conversation-export helpers.
 - `src/evaluation.py` parses reference TXT/SRT/VTT files and computes normalized
   whole-file word or mixed-unit match scores without model or network calls.
 - `src/reference_tables.py` reads XLSX/CSV/TSV references and suggests source and
@@ -510,25 +543,25 @@ An already running translation may finish, but cannot populate the new conversat
   weight tensors total about 9.9 GiB on a Mac using Tencent's bfloat16 path,
   with additional memory needed for inference, uploads, and pending work.
 
-Use the browser on the same Mac as Streamlit. If microphone access fails, check
-browser permissions, press Stop, then retry. Remote hosting is outside this
-version's scope.
-
-The Streamlit/WebRTC versions are pinned to the combination verified locally;
-WebRTC 0.78.1 repeatedly reset the microphone connection during testing.
-File watching is disabled to avoid scanning Transformers' lazy imports.
-Restart Streamlit after editing Python files.
+Use the browser on the same computer as the FastAPI server. Microphone capture
+requires a secure context (localhost qualifies), microphone permission, AudioWorklet,
+Web Audio and WebSocket support. The UI names unsupported capabilities; uploads remain
+available without microphone access. Remote hosting and authentication are outside
+this version's scope. The server binds to loopback and accepts only local frontend
+origins. Restart it after editing Python files.
 
 ### Read English aloud while translating
 
-In **Microphone** or **Upload WAV**, turn on **Read English aloud** before starting.
+In **Microphone** or **Upload WAV**, turn on **Spoken English** before or during a session. Text-only output is the default.
+Enabling speech mid-session starts with new segments only; it never replays the
+earlier transcript. Disabling it stops speech immediately while translation continues.
 The **Text-to-speech model** dropdown offers **gpt-4o-mini-tts** (default) and
 **tts-1-hd** for both microphone and uploaded audio. Both use the same English
 text, speaker mapping, streaming player, and initial delay. `tts-1-hd` is the
 HD speech option; it does not accept the extra delivery instructions used by
 `gpt-4o-mini-tts`, so those are omitted from its API request. The player and exports
 identify the selected model.
-The player is prepared before you press **Start recording** or **Transcribe file**.
+The player is prepared before you press **Start subtitles** or **Transcribe file**.
 That normal interaction enables browser sound where permitted. Speech generates
 silently during a **1-minute lead-in**, then playback starts automatically once
 audio is available. The countdown starts when the first accepted English passage
@@ -563,7 +596,7 @@ adding an assistant reply or commentary. Each accepted phrase is spoken once.
 
 This works with all three translation choices. In modes with an **Astra Correction**
 column, speech uses its accepted **Corrected** or **Confirmed** English in source
-order. The **Astra speech mode** dropdown offers:
+order. The **Voice settings → Speech review** dropdown offers:
 
 - **Live corrections** (default): speak the first accepted Astra correction without
   waiting for sequential conversation review. For `gpt-6-astra`, the first pass uses
@@ -576,9 +609,10 @@ order. The **Astra speech mode** dropdown offers:
 
 Low reasoning trades some review depth for speed. Live speech can differ from the
 later final record. Both modes still wait for complete, validated corrections;
-they do not speak a partial model response. Speech settings apply only when
-**Read English aloud** is enabled and are frozen when the conversation starts.
-Without speech, correction reasoning is unchanged.
+they do not speak a partial model response. Speech settings apply only when spoken output is enabled. ASR, translation and
+correction settings remain frozen at Start: enabling speech later does not lower
+the already-selected correction reasoning effort. Changing the speech model or mode
+starts a new speech queue for future segments and a new one-minute lead-in.
 
 Drafts and paused/failed review fallbacks are never spoken. A failed correction
 holds subsequent speech until the correction is retried successfully; no fast
@@ -593,14 +627,13 @@ finishes. Speech generation and browser playback stream before the full conversa
 is complete. There is still translation, phrase-buffering, API and playback latency.
 Tencent output, unreviewed drafts in Astra modes, failed/filtered English,
 original-language text and evaluation references are never read aloud. Accepted
-rows are queued only once across refreshes. Settings are frozen for each conversation; the next recording
-or file cancels old voice work and clears its playback queue. Evaluation has no speech
+rows are queued only once across refreshes. The next recording or file cancels old voice work and clears its playback queue. Evaluation has no speech
 option.
 
 [`src/speech.py`](src/speech.py) uses OpenAI's
 [streaming Speech API](https://developers.openai.com/api/docs/guides/text-to-speech)
 with server-side credentials and 24 kHz PCM16. The persistent browser player in
-`src/speech_player/` uses one Web Audio clock to schedule ready chunks contiguously,
+`frontend/src/audio/` uses one Web Audio playback clock, separate from capture, to schedule ready chunks contiguously,
 deduplicates refreshes, and acknowledges played chunks so the server releases them.
 Up to two TTS requests run ahead, but their PCM is released strictly in phrase order.
 Each in-flight request buffers at most two seconds; the published audio queue is
@@ -617,13 +650,14 @@ after an underrun. Voice failures are reported separately without automatic retr
 start a new conversation to retry. This adds speech API usage to your OpenAI account.
 The initial lead-in reduces interruptions; it cannot guarantee uninterrupted speech
 if recognition, correction, or TTS consistently falls behind playback.
-No new Python dependency is required.
+The browser audio layer uses native Web Audio; credentials remain in Python.
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
-node --test tests/test_speech_player.js
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
 Tests exercise audio resampling, WAV validation, recording and upload lifecycles,

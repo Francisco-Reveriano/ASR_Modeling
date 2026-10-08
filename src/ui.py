@@ -1,4 +1,4 @@
-"""Small, presentation-only helpers for the Streamlit conversation view."""
+"""Pure conversation rendering and export helpers."""
 
 from html import escape
 

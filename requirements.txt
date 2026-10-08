@@ -12,9 +12,11 @@ librosa>=0.11
 scipy
 av>=15.1.0
 
-# Streamlit app and browser microphone capture
-streamlit==1.65.0
-streamlit-webrtc==0.64.5
+# Local HTTP server and browser PCM transport
+fastapi==0.142.4
+starlette==1.7.0
+uvicorn==0.54.0
+python-multipart==0.0.32
 
 # API translation and configuration
 python-dotenv

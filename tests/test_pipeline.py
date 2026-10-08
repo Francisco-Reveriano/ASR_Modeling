@@ -336,7 +336,8 @@ class LiveTranscriberTests(unittest.TestCase):
             self.finish(pipeline)
 
         snapshot = pipeline.snapshot()
-        self.assertIn("decode broke", snapshot["error"])
+        self.assertIn("Transcription failed", snapshot["error"])
+        self.assertNotIn("decode broke", snapshot["error"])
         self.assertFalse(snapshot["accepting"])
         self.assertEqual(snapshot["texts"], [])
         self.assertEqual(snapshot["pending"], 0)
@@ -353,9 +354,35 @@ class LiveTranscriberTests(unittest.TestCase):
             self.finish(pipeline)
 
         snapshot = pipeline.snapshot()
-        self.assertIn("VAD broke", snapshot["error"])
+        self.assertIn("Audio processing failed", snapshot["error"])
+        self.assertNotIn("VAD broke", snapshot["error"])
         self.assertFalse(snapshot["accepting"])
         self.assertEqual(snapshot["pending"], 0)
+
+    def test_close_discards_queued_and_in_flight_transcription(self):
+        entered, release = Event(), Event()
+        calls = []
+
+        def transcribe(samples):
+            calls.append(len(samples))
+            entered.set()
+            release.wait(3)
+            return "must not appear"
+
+        pipeline = self.make_pipeline(ScriptedVAD({1: {"start": 0}}),
+                                      transcribe=transcribe, max_segment_seconds=0.032)
+        try:
+            pipeline.push(audio_frame(np.ones(FRAME_SIZE * 3)))
+            self.assertTrue(entered.wait(1))
+            pipeline.close()
+            pipeline.close()
+            self.assertFalse(pipeline.snapshot()["accepting"])
+            self.assertEqual(pipeline.snapshot()["pending"], 0)
+        finally:
+            release.set()
+        self.finish(pipeline)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pipeline.snapshot()["texts"], [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An interactive guide to Silero VAD, Nemotron speaker diarization, and the exact audio chunk sizes used in ASR Modeling.">
+  <title>Speech, speakers &amp; chunk sizes · ASR Modeling</title>
+  <style>
+    :root{color-scheme:light;--ink:#162d37;--muted:#526873;--paper:#f6f7f3;--surface:#fff;--line:#dce3df;--green:#126650;--green-soft:#e4f3ea;--blue:#295c93;--blue-soft:#e9f0fa;--amber:#815217;--amber-soft:#fff0d5;--purple:#725395;--code:#142731;--radius:18px}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:var(--green);text-underline-offset:4px}button,input,select{font:inherit}button,select{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #e2a749;outline-offset:4px}button{border:1px solid var(--line);border-radius:9px;padding:8px 13px;background:var(--surface);color:var(--ink)}button:hover{background:#eff4f0}code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}p{margin:0 0 16px}h1,h2,h3{line-height:1.15;letter-spacing:-.035em;margin:0}h1{font-size:clamp(38px,5.5vw,65px);max-width:850px;font-weight:650}h2{font-size:clamp(27px,3vw,38px);font-weight:650}h3{font-size:21px;letter-spacing:-.015em}small{font-size:13px}p code,li code,td code{font-size:.87em;overflow-wrap:anywhere}section{margin-top:76px}hr{border:0;border-top:1px solid var(--line);margin:32px 0}.wrap{max-width:1180px;margin:0 auto;padding:0 30px}.topbar{border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(246,247,243,.97);z-index:10}.topbar .wrap{min-height:72px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{font-size:15px;letter-spacing:-.02em;font-weight:650;white-space:nowrap;color:var(--ink);text-decoration:none}.brand svg{vertical-align:middle;margin-right:9px}.nav{display:flex;gap:23px;flex-wrap:wrap}.nav a{font-size:13px;color:var(--muted);text-decoration:none}.nav a:hover{color:var(--green)}.eyebrow{color:var(--green);font-size:12px;font-weight:650;letter-spacing:.13em;text-transform:uppercase;margin-bottom:18px}.hero{padding-top:64px}.lede{font-size:19px;max-width:780px;color:var(--muted);margin:24px 0 26px}.badge{display:inline-block;border-radius:6px;padding:3px 8px;font-size:12px;font-weight:600;line-height:1.6;background:var(--green-soft);color:var(--green)}.meta{display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:13px;color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:38px 0 0;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:var(--surface)}.metric{padding:26px 28px}.metric+.metric{border-left:1px solid var(--line)}.metric .label{font-size:13px;color:var(--muted)}.metric .value{font-size:39px;font-weight:650;line-height:1.4;letter-spacing:-.05em}.metric .value small{font-size:18px;letter-spacing:0;font-weight:400;margin-left:5px}.metric .sub{font-size:13px;color:var(--muted)}.section-head{display:grid;grid-template-columns:1.15fr 1fr;gap:40px;align-items:end;margin-bottom:28px}.section-head p{margin:0;color:var(--muted);font-size:15px}.section-head .eyebrow{margin-bottom:10px}.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:28px}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}.flow-source{text-align:center;padding:20px;border-bottom:1px solid var(--line);margin-bottom:22px}.flow-source strong{display:block;font-size:19px}.flow-source span{font-size:13px;color:var(--muted)}.flow-branches{display:grid;grid-template-columns:1fr 1fr;gap:22px;position:relative}.lane{border-radius:12px;padding:25px;background:var(--green-soft)}.lane.blue{background:var(--blue-soft)}.lane .step{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;color:var(--green)}.lane.blue .step{color:var(--blue)}.lane p{font-size:14px;margin:14px 0 0;color:#354e59}.lane .pill{font-size:12px;display:inline-block;background:#ffffffa8;border-radius:5px;padding:3px 8px;margin-top:13px}.flow-join{margin-top:22px;padding:22px;border:1px solid var(--line);border-radius:12px;display:grid;grid-template-columns:1fr 1.2fr;gap:25px}.flow-join p{margin:0;font-size:14px;color:var(--muted)}.flow-out{padding:18px 8px 0;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;font-size:13px}.flow-out .arrow{color:#87988e}.note{font-size:14px;color:var(--muted);padding:15px 19px;background:#edf1eb;border-radius:10px;margin-top:20px}.note strong{color:var(--ink)}.controls{display:flex;gap:24px;flex-wrap:wrap;align-items:end;padding-bottom:22px;border-bottom:1px solid var(--line)}.control{flex:1;min-width:220px}.control label{display:flex;gap:10px;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;margin-bottom:8px}.control select{width:100%;border:1px solid var(--line);border-radius:8px;padding:11px 12px;background:#fafbf8;color:var(--ink)}.control input[type=range]{width:100%;accent-color:var(--green);margin:14px 0 7px}.control small{display:block;color:var(--muted)}.measurements{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;padding:25px 0}.measurement span{display:block;font-size:12px;color:var(--muted)}.measurement strong{display:block;font-size:28px;font-weight:600;letter-spacing:-.035em}.measurement small{color:var(--muted);font-size:12px}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:10px 0}.legend span{display:flex;align-items:center;gap:7px}.swatch{display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--green)}.swatch.context{background:#d6ad57}.swatch.wave{background:var(--blue)}.swatch.s2{background:var(--blue)}.swatch.s3{background:var(--purple)}.diagram{width:100%;height:auto;display:block;overflow:visible}.diagram text{font-family:inherit;font-size:13px;fill:var(--muted)}.diagram .axis{font-size:11px}.detail{font-size:13px;color:var(--muted);margin-top:10px;min-height:2.4em}.table-scroll{overflow-x:auto;margin-top:24px;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;font-size:13px;text-align:left;white-space:nowrap}th{font-weight:600;color:var(--muted);background:#f4f6f2;font-size:12px}th,td{padding:13px 16px;border-bottom:1px solid var(--line)}tr:last-child td{border-bottom:0}tbody tr.current{background:#f0f8f2}caption{text-align:left;padding:15px 16px;font-size:14px;font-weight:600}.formula{padding:18px 20px;background:#f4f6f2;border-radius:10px;font:14px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-x:auto;white-space:nowrap;margin:20px 0}.formula b{color:var(--green);font-weight:600}.fine{font-size:13px;color:var(--muted)}.explain-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:24px}.explain-grid h3{font-size:17px;margin-bottom:11px}.explain-grid p{font-size:14px;color:var(--muted);margin:0}.choice{display:flex;gap:9px;align-items:center;font-size:14px}.choice input{accent-color:var(--green);width:17px;height:17px}.row-preview{display:flex;gap:9px;flex-wrap:wrap;margin-top:20px}.turn{padding:13px 15px;border-radius:9px;background:#f1f5ef;flex:1;min-width:160px}.turn strong{font-size:13px;display:block}.turn span{font-size:12px;color:var(--muted)}.number{font:12px ui-monospace,monospace;color:var(--green);margin-bottom:5px}.code-card{background:var(--code);color:#e5ede7;border-radius:14px;overflow:hidden;margin-top:22px}.code-head{padding:15px 19px;border-bottom:1px solid #36505d;display:flex;justify-content:space-between;gap:20px;align-items:center;font-size:13px}.code-head span{color:#bacdc8}.code-head button{background:#203b45;border-color:#45616b;color:#f0f5f2;font-size:12px;padding:5px 11px}.code-head button:hover{background:#2b4b53}.code-card pre{margin:0;padding:22px;overflow-x:auto;font-size:13px;line-height:1.7;tab-size:4}.code-card code{white-space:pre}.code-desc{font-size:15px;color:var(--muted);margin:13px 0 0;max-width:940px}.code-caption{font-size:13px;color:var(--muted);margin-top:10px}.split-list{padding-left:20px;margin:12px 0 0;color:var(--muted);font-size:14px}.split-list li{padding:4px 0}.settings-table td:first-child{font-weight:500;color:var(--ink)}.sources{display:grid;grid-template-columns:1fr 1fr;gap:26px}.sources h3{font-size:18px;margin-bottom:14px}.sources ul{margin:0;padding-left:18px;font-size:14px}.sources li{padding:5px 0}.sources p{font-size:13px;color:var(--muted);margin:15px 0 0}.footer{padding:36px 0 45px;margin-top:60px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}.footer .wrap{display:flex;justify-content:space-between;gap:20px}.skip{position:absolute;left:20px;top:-100px;z-index:20;background:white;padding:8px}.skip:focus{top:8px}noscript p{background:var(--amber-soft);padding:16px;border-radius:10px}.status{min-height:20px;margin-top:8px;font-size:12px;color:var(--muted)}
+    @media(max-width:800px){.wrap{padding:0 22px}.topbar .wrap{min-height:64px}.nav{gap:13px}.nav a{font-size:12px}.hero{padding-top:40px}.section-head{grid-template-columns:1fr;gap:15px}.metric{padding:21px 19px}.metric .value{font-size:31px}.two-col,.flow-branches,.sources{grid-template-columns:1fr}.flow-join{grid-template-columns:1fr;gap:12px}.explain-grid{grid-template-columns:1fr}.panel{padding:20px}.measurement strong{font-size:23px}.measurement small{font-size:11px}.footer .wrap{display:block}}
+    @media(max-width:530px){.nav{display:none}.metrics{grid-template-columns:1fr}.metric+.metric{border-left:0;border-top:1px solid var(--line)}.metric{display:grid;grid-template-columns:1fr auto;gap:4px 16px;align-items:center;padding:15px 20px}.metric .value{grid-column:2;grid-row:1/3}.metric .sub{grid-column:1}.lede{font-size:17px}.measurements{gap:12px;grid-template-columns:1fr}.measurement{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline}.measurement span{width:100%}.measurement strong{font-size:27px}.control{min-width:180px}section{margin-top:52px}.diagram text{font-size:14px}.diagram .axis{font-size:12px}.table-scroll{margin-left:-4px;margin-right:-4px}.code-card pre{font-size:12px;padding:17px}.code-head{padding:13px 16px}.sources{gap:24px}}
+    .chart-viewport{overflow-x:auto}.chart-viewport .diagram{min-width:840px}
+    .output-card{background:#edf5ef;color:var(--ink);border:1px solid var(--line);margin-top:10px}.output-card .code-head{border-bottom-color:var(--line);flex-wrap:wrap;gap:6px 20px}.output-card .code-head span{color:var(--green);font-weight:600}.output-card .code-head small{color:var(--muted);font-size:12px}
+    @media(max-width:530px){.diagram .axis{font-size:13px}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+    @media print{.topbar{position:static}.nav,button,.controls,.choice{display:none}body{background:white;font-size:12px}.wrap{max-width:none;padding:0 15px}.hero{padding-top:25px}section{margin-top:35px}h1{font-size:35px}h2{font-size:25px}.panel,.code-card,.metrics{break-inside:avoid}.code-card{background:#f4f6f2;color:#162d37;border:1px solid #ccc}.code-head span{color:#526873}.code-card pre{font-size:10px;white-space:pre-wrap}.code-card code{white-space:pre-wrap}.footer{margin-top:25px}a{color:inherit}}
+  </style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar"><div class="wrap">
+  <a class="brand" href="#main"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 10v4m4-8v12m5-16v20m5-16v12m4-8v4"/></svg>ASR Modeling <span style="font-weight:400;color:var(--muted)">/ field notes</span></a>
+  <nav class="nav" aria-label="Page sections"><a href="#flow">Flow</a><a href="#chunks">Chunk sizes</a><a href="#turns">Speaker turns</a><a href="#code">Python code</a><a href="#sources">Sources</a></nav>
+</div></header>
+<main id="main" class="wrap">
+  <div class="hero">
+    <div class="eyebrow">Silero VAD + NVIDIA Nemotron-3-Diarization</div>
+    <h1>From speech<br>to speaker turns.</h1>
+    <p class="lede">Silero finds speech boundaries. Nemotron estimates which anonymous speaker is active. The app combines their timing before sending each speech turn to ASR.</p>
+    <div class="meta"><span class="badge">Current app configuration</span><span>16 kHz · mono · float32</span><span>Verified 7 October 2026</span></div>
+    <div class="metrics" aria-label="Three distinct chunk sizes">
+      <div class="metric"><div class="label">Silero input frame</div><div class="value">32<small>ms</small></div><div class="sub">512 audio samples per VAD call</div></div>
+      <div class="metric"><div class="label">Nemotron nominal context</div><div class="value">1.04<small>s</small></div><div class="sub">720 ms scored + 320 ms lookahead</div></div>
+      <div class="metric"><div class="label">ASR segment ceiling</div><div class="value">15<small>s</small></div><div class="sub">Variable speech turns, up to 240,000 samples</div></div>
+    </div>
+    <noscript><p>The default sizes, tables and code remain readable without JavaScript. Enable JavaScript to compare windows and speaker-turn examples.</p></noscript>
+  </div>
+
+  <section id="flow">
+    <div class="section-head"><div><div class="eyebrow">01 / The pipeline</div><h2>Two workers share<br>one audio timeline.</h2></div><p>Every sample reaches speaker detection, including silence. VAD chooses the speech regions that will become transcript rows.</p></div>
+    <div class="panel">
+      <div class="flow-source"><strong>Microphone or uploaded WAV</strong><span>Resample to mono 16,000 samples/second. Retain absolute audio offsets.</span></div>
+      <div class="flow-branches">
+        <div class="lane"><div class="step">Path A · Speech detection</div><h3>Silero VAD</h3><p>A 512-sample frame updates speech activity. Speech starts at probability ≥ 0.5. Sustained low speech probability ends it after the configured 500 ms silence window.</p><span class="pill">Output: speech start/end samples</span></div>
+        <div class="lane blue"><div class="step">Path B · Speaker detection</div><h3>Nemotron</h3><p>Continuous audio feeds overlapping model windows. The speaker cache carries history across calls. Frame probabilities become intervals for up to eight anonymous speaker channels.</p><span class="pill">Output: start, end, speaker channel</span></div>
+      </div>
+      <div class="flow-join"><h3>Align and split<br>clear speaker changes</h3><p>Match speaker intervals to each VAD segment. Cut stable sequential turns before ASR; keep substantial overlapping voices together. The ASR worker can wait for timing for up to 3 s live or 30 s on upload, then use the original segment if timing is late.</p></div>
+      <div class="flow-out"><span>Speaker-aware audio</span><span class="arrow" aria-hidden="true">→</span><span><strong>OpenAI ASR</strong> <small>(default)</small></span><span class="arrow" aria-hidden="true">→</span><span>Original transcript</span><span class="arrow" aria-hidden="true">→</span><span>English translation</span></div>
+    </div>
+    <p class="note"><strong>Keep the cache continuous.</strong> Do not create a new Nemotron stream for every VAD segment or remove silence before diarization. Both operations break the shared time coordinates; resetting also discards speaker history. Speaker labels are anonymous channels, not verified identities.</p>
+  </section>
+
+  <section id="chunks">
+    <div class="section-head"><div><div class="eyebrow">02 / Determine the chunk size</div><h2>The processor owns<br>the model window.</h2></div><p>Choose a mode to inspect its exact dimensions. This calculator only changes the explanation. The running app uses <code>low_latency</code>.</p></div>
+    <div class="panel">
+      <div class="controls">
+        <div class="control"><label for="mode">Nemotron streaming mode <span id="mode-state" class="badge">App default</span></label><select id="mode"><option value="low_latency">low_latency · 9 + 4 encoder frames</option><option value="very_low_latency">very_low_latency · 6 + 2 encoder frames</option><option value="ultra_low_latency">ultra_low_latency · 3 + 1 encoder frames</option></select></div>
+        <div class="control"><label for="window">Window in the stream <output id="window-number" for="window">1 / 4</output></label><input id="window" type="range" min="1" max="4" step="1" value="1"><small>The first window has different sample geometry.</small></div>
+      </div>
+      <div class="measurements" aria-live="polite" aria-atomic="true">
+        <div class="measurement"><span>Raw samples in this model call</span><strong id="raw-samples">16,680</strong><small id="raw-duration">1.0425 s of waveform</small></div>
+        <div class="measurement"><span>Newly scored audio per full step</span><strong id="scored-duration">720 ms</strong><small id="scored-samples">11,520 samples · 72 mel frames</small></div>
+        <div class="measurement"><span>Future context / lookahead</span><strong id="lookahead-duration">320 ms</strong><small id="nominal-duration">Nominal buffer: 1,040 ms</small></div>
+      </div>
+      <div class="legend"><span><i class="swatch"></i>Scored on this step</span><span><i class="swatch context"></i>Lookahead; scored later</span><span><i class="swatch wave"></i>Raw waveform window</span></div>
+      <div class="chart-viewport" role="region" aria-label="Model window timeline; scroll horizontally on narrow screens" tabindex="0"><svg id="window-diagram" class="diagram" viewBox="0 0 960 235" role="img" aria-labelledby="window-title window-description"><title id="window-title">Nemotron low-latency window 1</title><desc id="window-description">The first window consumes 16,680 samples, scores 720 milliseconds and looks ahead 320 milliseconds.</desc><g id="window-marks"></g></svg></div>
+      <p id="window-detail" class="detail">First call: samples [0, 16,680). The next call starts at sample 11,264, so lookahead and analysis context are retained.</p>
+      <div class="formula" aria-label="Window formulas">1 encoder frame = 8 mel frames × 160 samples ÷ 16,000 Hz = <b>80 ms</b><br>Nominal context = (scored encoder frames + lookahead frames) × 80 ms<br>Step advance = scored encoder frames × 8 × 160 samples</div>
+      <p class="fine">The published 1.04 s is nominal input context, excluding computation, model loading and queue time. The actual first waveform is 1.0425 s; later waveforms are 1.065 s because the processor includes analysis-window context. A later call reuses old samples—it does not require a fresh 1.065 s each time. <a href="https://huggingface.co/nvidia/Nemotron-3-Diarization#setting-up-streaming-configuration" target="_blank" rel="noopener noreferrer">NVIDIA’s latency definition ↗</a></p>
+      <div class="table-scroll"><table><caption>Exact values from the installed Transformers 5.18.0 processor</caption><thead><tr><th scope="col">Mode</th><th scope="col">Scored + lookahead</th><th scope="col">First raw window</th><th scope="col">Later raw window</th><th scope="col">Step advance</th></tr></thead><tbody>
+        <tr data-mode="low_latency" class="current"><td><code>low_latency</code> · app default</td><td>720 + 320 ms</td><td>16,680 / 1.0425 s</td><td>17,040 / 1.065 s</td><td>11,520 / 720 ms</td></tr>
+        <tr data-mode="very_low_latency"><td><code>very_low_latency</code></td><td>480 + 160 ms</td><td>10,280 / 0.6425 s</td><td>10,640 / 0.665 s</td><td>7,680 / 480 ms</td></tr>
+        <tr data-mode="ultra_low_latency"><td><code>ultra_low_latency</code></td><td>240 + 80 ms</td><td>5,160 / 0.3225 s</td><td>5,520 / 0.345 s</td><td>3,840 / 240 ms</td></tr>
+      </tbody></table></div>
+      <div class="explain-grid"><div><h3>First window</h3><p><code>((C + R) × 8 − 1) × 160 + 200</code> samples. Here <code>C</code> is the scored encoder-frame count; <code>R</code> is right context.</p></div><div><h3>Later windows</h3><p><code>(C + R) × 8 × 160 + 400</code> samples. Their start comes from <code>audio_chunk_start()</code>, not the end of the previous window.</p></div><div><h3>End of input</h3><p>Flush the remaining tail with <code>final=True</code>. The repository adapter removes lookahead on that final call so the remaining valid frames are scored.</p></div></div>
+    </div>
+    <p class="note"><strong>Use the processor properties in code.</strong> These exact raw sizes depend on the saved feature extractor: 160-sample hop, 400-sample analysis window and 512-point FFT. A mode with less context makes more calls per second; it does not guarantee better speed or speaker accuracy on your hardware.</p>
+  </section>
+
+  <section id="turns">
+    <div class="section-head"><div><div class="eyebrow">03 / From regions to transcript rows</div><h2>A pause and a speaker<br>change are different events.</h2></div><p>A new speaker can start without a 500 ms pause. Silero may keep both voices in one speech segment; Nemotron’s timing can split it into turns.</p></div>
+    <div class="panel">
+      <label class="choice"><input type="checkbox" id="overlap"> Add 500 ms of overlapping speech at the first speaker change</label>
+      <p class="fine" style="margin-top:10px">Illustrative 12-second timeline with supplied speaker intervals. This page does not run either model or process your audio.</p>
+      <div class="legend"><span><i class="swatch"></i>Speaker 1</span><span><i class="swatch s2"></i>Speaker 2</span><span><i class="swatch s3"></i>Speaker 3</span></div>
+      <div class="chart-viewport" role="region" aria-label="Speaker-turn timeline; scroll horizontally on narrow screens" tabindex="0"><svg id="turn-diagram" class="diagram" viewBox="0 0 960 245" role="img" aria-labelledby="turn-title turn-description"><title id="turn-title">Speech segments split at speaker changes</title><desc id="turn-description">Two VAD speech regions contain four sequential speaker turns.</desc><g id="turn-marks"></g></svg></div>
+      <div id="turn-rows" class="row-preview" aria-live="polite"></div>
+      <p id="turn-detail" class="detail">The first VAD region splits at 3.20 s; the second splits at 9.00 s. Every sample inside each original VAD region is retained exactly once.</p>
+    </div>
+    <div class="two-col" style="margin-top:22px"><div class="panel"><h3>When the app cuts</h3><ul class="split-list"><li>Find single-speaker spans at least 350 ms long.</li><li>Use consecutive stable spans from different speakers as anchors.</li><li>Place a cut between the anchors, commonly in a pause.</li><li>Require at least 350 ms on each side of the candidate cut.</li></ul></div><div class="panel"><h3>When the app keeps a mixed row</h3><ul class="split-list"><li>At least 250 ms of overlap between anchors prevents that cut.</li><li>A short activity flicker does not establish a new stable turn.</li><li>Labels follow duration overlap with the audio row.</li><li>A second label needs at least 80 ms and 25% of the dominant speaker’s overlap.</li></ul></div></div>
+    <p class="note"><strong>Diarization is an estimate.</strong> Overlapping voices cannot be separated into clean individual recordings by cutting a mono waveform. Channels may drift or split one person into extra labels. These thresholds are app rules, not confidence scores or guarantees of identity.</p>
+  </section>
+
+  <section id="sizes">
+    <div class="section-head"><div><div class="eyebrow">04 / The complete size map</div><h2>Which number controls what?</h2></div><p>Audio windows, queue batches, speech segments and playback buffering serve different purposes. All sample counts below use the app’s 16 kHz audio timeline.</p></div>
+    <div class="table-scroll"><table class="settings-table"><thead><tr><th scope="col">Layer</th><th scope="col">Current setting</th><th scope="col">What it determines</th></tr></thead><tbody>
+      <tr><td>Silero frame</td><td>512 samples · 32 ms</td><td>One VAD update; the detector retains state between frames.</td></tr>
+      <tr><td>VAD silence window</td><td>8,000 samples · 500 ms</td><td>Pause needed for an endpoint; decisions are quantized to VAD frames.</td></tr>
+      <tr><td>VAD speech padding</td><td>2,400 samples · 150 ms per side</td><td>Context around a speech region, clipped or adjusted at neighboring boundaries.</td></tr>
+      <tr><td>Live capture pre-roll</td><td>2,912 samples · 182 ms</td><td>Retained history: 150 ms padding + one 32 ms VAD frame.</td></tr>
+      <tr><td>Upload minimum speech</td><td>250 ms before padding</td><td>Filters short speech regions in the offline upload path.</td></tr>
+      <tr><td>Speaker-worker feed batch</td><td>At most 16,000 samples · 1 s</td><td>Splits queued audio for cancellation and progress; not a model-window size.</td></tr>
+      <tr><td>Nemotron mel hop / output grid</td><td>160 samples · 10 ms</td><td>Feature hop and speaker-activity timestamp resolution.</td></tr>
+      <tr><td>Nemotron low-latency step</td><td>11,520 samples · 720 ms</td><td>New scored duration per full inference; context overlaps between calls.</td></tr>
+      <tr><td>ASR segment limit</td><td>240,000 samples · 15 s</td><td>Upper bound. Silence and speaker changes usually create shorter rows.</td></tr>
+      <tr><td>Optional TTS startup buffer</td><td>60 s after the first accepted English passage</td><td>Playback lead-in; it does not set VAD or diarization chunk sizes.</td></tr>
+    </tbody></table></div>
+    <p class="code-caption">The 250 ms minimum applies to WAV segmentation via <code>get_speech_timestamps()</code>. Live <code>VADIterator</code> does not use that upload-only setting. OpenAI ASR resamples accepted segments to 24 kHz internally; boundaries and speaker timing stay on the 16 kHz timeline.</p>
+  </section>
+
+  <section id="code">
+    <div class="section-head"><div><div class="eyebrow">05 / Read and run</div><h2>Code and its output.</h2></div><p>Run these examples from the repository root in the existing virtual environment. Replace <code>sample.wav</code> with your WAV file path. The configuration probe loads only the processor; the other examples require the prepared local model assets.</p></div>
+    <p class="note">The configuration output was captured from the installed processor. Audio-dependent outputs below use <strong>illustrative timing and speaker activity</strong>; your WAV will produce its own boundaries and speaker assignments.</p>
+    <h3>1. Ask Nemotron for the exact sizes</h3>
+    <p class="code-desc">Read the configured properties instead of hardcoding “one-second chunks.” The printed sample counts are the source of the comparison table above.</p>
+    <div class="code-card"><div class="code-head"><span>Python · processor configuration only</span><button type="button" data-copy="probe-code">Copy code</button></div><pre><code id="probe-code">from transformers import AutoProcessor
+
+processor = AutoProcessor.from_pretrained(
+    "Models/Nemotron-3-Diarization",
+    local_files_only=True,
+)
+rate = processor.feature_extractor.sampling_rate
+hop = processor.feature_extractor.hop_length
+
+for mode in ("low_latency", "very_low_latency", "ultra_low_latency"):
+    processor.set_streaming_mode(mode)
+    first = processor.num_samples_first_audio_chunk
+    later = processor.num_samples_per_audio_chunk
+    advance = processor.num_mel_frames_per_step * hop
+    next_start = processor.audio_chunk_start(
+        processor.num_mel_frames_per_step
+    )
+    print(mode)
+    print(f"  first: {first} samples / {first / rate:.4f} s")
+    print(f"  later: {later} samples / {later / rate:.4f} s")
+    print(f"  advance: {advance} samples / {advance / rate:.3f} s")
+    print(f"  second window starts at sample {next_start}")
+    print(f"  nominal context: {processor.streaming_latency_ms} ms")</code></pre></div>
+    <div class="code-card output-card" role="region" aria-labelledby="probe-output-title"><div class="code-head"><span id="probe-output-title">Output · exact processor values</span><small>Captured locally · Transformers 5.18.0</small></div><pre><code id="probe-output">low_latency
+  first: 16680 samples / 1.0425 s
+  later: 17040 samples / 1.0650 s
+  advance: 11520 samples / 0.720 s
+  second window starts at sample 11264
+  nominal context: 1040 ms
+very_low_latency
+  first: 10280 samples / 0.6425 s
+  later: 10640 samples / 0.6650 s
+  advance: 7680 samples / 0.480 s
+  second window starts at sample 7424
+  nominal context: 640 ms
+ultra_low_latency
+  first: 5160 samples / 0.3225 s
+  later: 5520 samples / 0.3450 s
+  advance: 3840 samples / 0.240 s
+  second window starts at sample 3584
+  nominal context: 320 ms</code></pre></div>
+    <p class="code-caption"><code>first</code> and <code>later</code> are waveform lengths; <code>advance</code> is newly scored audio per call. <code>audio_chunk_start(0)</code> returns −256 for uncentered geometry; the special first call always starts at sample 0.</p>
+
+    <h3 style="margin-top:34px">2. Watch Silero report speech boundaries</h3>
+    <p class="code-desc">A streaming detector consumes exact 512-sample frames. The repository’s <code>load_vad()</code> sets the threshold, silence and padding values. This example displays detector events; the production live pipeline additionally buffers audio, limits segments and flushes an open utterance on Stop.</p>
+    <div class="code-card"><div class="code-head"><span>Python · example WAV path is relative to the repository</span><button type="button" data-copy="vad-code">Copy code</button></div><pre><code id="vad-code">from pathlib import Path
+import numpy as np
+import torch
+
+from src.pipeline import FRAME_SIZE, SAMPLE_RATE, load_vad
+from src.uploads import decode_wav
+
+audio = decode_wav(Path("sample.wav").read_bytes())
+vad = load_vad()  # threshold=0.5; silence=500 ms; padding=150 ms
+
+for offset in range(0, len(audio), FRAME_SIZE):
+    real_samples = audio[offset:offset + FRAME_SIZE]
+    frame = np.pad(real_samples, (0, FRAME_SIZE - len(real_samples)))
+    event = vad(torch.from_numpy(frame))
+    if event:
+        # Events already include padding. Clamp to real audio length.
+        seconds = {
+            name: min(sample, len(audio)) / SAMPLE_RATE
+            for name, sample in event.items()
+        }
+        print(seconds)
+
+# One model call = 512 / 16_000 = 0.032 seconds.
+# These are speech-boundary events, not speaker IDs or ASR text.</code></pre></div>
+    <div class="code-card output-card" role="region" aria-labelledby="vad-output-title"><div class="code-head"><span id="vad-output-title">Example output · two speech regions</span><small>Illustrative · synthetic detector probabilities</small></div><pre><code id="vad-output">{'start': 0.266}
+{'end': 5.75}
+{'start': 6.442}
+{'end': 11.446}</code></pre></div>
+    <p class="code-caption">Values are seconds from the beginning of the WAV, including speech padding. Pair each <code>start</code> with the following <code>end</code>: the first speech region is 0.266–5.750 s. Frames without a boundary event print nothing. An <code>end</code> event arrives after the detector has waited for silence; its reported boundary is earlier than its delivery time.</p>
+
+    <h3 style="margin-top:34px">3. Combine VAD segments with the speaker worker</h3>
+    <p class="code-desc">This uses the app’s actual upload and diarization helpers. Nemotron receives the full waveform once; Silero selects ASR regions. Each output turn keeps the source timeline and can be passed to the selected ASR adapter.</p>
+    <div class="code-card"><div class="code-head"><span>Python · local Nemotron inference · no transcription API calls</span><button type="button" data-copy="combine-code">Copy code</button></div><pre><code id="combine-code">from pathlib import Path
+
+from src.diarization import DiarizationSession, prepare_speaker_turns
+from src.pipeline import SAMPLE_RATE, load_vad
+from src.uploads import decode_wav, speech_segments
+
+audio = decode_wav(Path("sample.wav").read_bytes())
+speakers = DiarizationSession(
+    max_pending_seconds=max(600, len(audio) / SAMPLE_RATE + 1)
+)
+speakers.push(audio)  # Preserve silence and the full original timeline.
+speakers.finish()    # Signal end of input; the worker drains and flushes.
+
+try:
+    for region in speech_segments(audio, load_vad(), with_timestamps=True):
+        timing = {k: v for k, v in region.items() if k != "audio"}
+        turns = prepare_speaker_turns(
+            region["audio"], timing, speakers, timeout=30
+        )
+        for turn in turns:
+            duration = len(turn["audio"]) / SAMPLE_RATE
+            print(
+                f"{turn['start_s']:.2f}–{turn['end_s']:.2f}s",
+                turn.get("speaker_id", "Speaker unknown"),
+                f"{duration:.3f}s ready for ASR",
+            )
+finally:
+    speakers.close()</code></pre></div>
+    <div class="code-card output-card" role="region" aria-labelledby="combine-output-title"><div class="code-head"><span id="combine-output-title">Example output · four ASR-ready turns</span><small>Illustrative · no-overlap timeline above</small></div><pre><code id="combine-output">0.25–3.20s Speaker 1 2.950s ready for ASR
+3.20–5.75s Speaker 2 2.550s ready for ASR
+6.45–9.00s Speaker 1 2.550s ready for ASR
+9.00–11.45s Speaker 3 2.450s ready for ASR</code></pre></div>
+    <p class="code-caption">Each line gives the turn’s absolute start/end time, anonymous speaker label and audio duration. These four rows come from the two VAD regions in the <a href="#turns">speaker-turn example</a> with overlap off. Speaker 1 appears twice because the same channel speaks again. The 5.75–6.45 s gap remains outside the ASR regions.</p>
+    <p class="code-caption">The wait occurs on a background ASR/preparation worker in the application, not on microphone capture or the rendering thread. A timeout preserves the original unsplit audio. Speaker IDs can arrive later.</p>
+
+    <details class="panel" style="margin-top:24px"><summary style="cursor:pointer;font-weight:600">What the Nemotron adapter does inside each call</summary><p class="code-desc">The production implementation in <a href="https://github.com/Francisco-Reveriano/ASR_Modeling/blob/07b9c21/src/diarization.py" target="_blank" rel="noopener noreferrer"><code>src/diarization.py</code></a> maintains a rolling audio buffer, advances by scored frames and passes <code>speaker_cache</code> between model calls. The sequence below is an abbreviated excerpt, not a standalone script.</p>
+      <div class="code-card"><div class="code-head"><span>Python · core inference sequence</span><button type="button" data-copy="core-code">Copy excerpt</button></div><pre><code id="core-code">inputs = processor(
+    window,
+    sampling_rate=16_000,
+    is_streaming=True,
+    is_first_audio_chunk=first,
+    is_last_audio_chunk=final,
+    return_tensors="pt",
+).to("cpu", dtype=torch.float32)
+if final:
+    inputs["num_lookahead_frames"] = 0
+
+with model_lock, torch.inference_mode():
+    result = model(**inputs, speaker_cache=speaker_cache)
+speaker_cache = result.speaker_cache
+
+# The next output's absolute offset advances by scored frames only.
+offset_seconds = scored_frames * 160 / 16_000
+scored_frames += result.logits.shape[1]
+intervals = processor.extract_speaker_dict(result.logits)[0]
+# Add offset_seconds to each interval's Start and End.
+# The adapter clips the final intervals to the real audio duration.
+
+# Inspect a full, non-final call; times below are absolute.
+print("logits shape:", tuple(result.logits.shape))
+print(f"chunk offset: {offset_seconds:.2f} s")
+for item in intervals:
+    channel = int(item["Speaker"])
+    print(
+        f"channel {channel} -&gt; Speaker {channel + 1}:",
+        f"{offset_seconds + item['Start']:.2f}–"
+        f"{offset_seconds + item['End']:.2f}s",
+    )</code></pre></div>
+      <div class="code-card output-card" role="region" aria-labelledby="core-output-title"><div class="code-head"><span id="core-output-title">Example output · second low-latency call</span><small>Illustrative · synthetic speaker activity</small></div><pre><code id="core-output">logits shape: (1, 72, 8)
+chunk offset: 0.72 s
+channel 0 -&gt; Speaker 1: 0.72–1.12s
+channel 1 -&gt; Speaker 2: 1.08–1.44s</code></pre></div>
+      <p class="code-caption">The shape is one stream × 72 scored frames × eight speaker channels. Each scored frame spans 10 ms. Here, two channels are active together from 1.08 to 1.12 s. The processor’s zero-based channel IDs become the app’s Speaker 1, Speaker 2 labels; it does not identify people by name.</p>
+    </details>
+    <div id="copy-status" class="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <section id="sources">
+    <div class="section-head"><div><div class="eyebrow">06 / Verify the details</div><h2>Grounded in the code.</h2></div><p>Application values are from commit <code>07b9c21</code> on <code>OpenAI</code>. Processor sizes were read from the locally installed Transformers 5.18.0 and the pinned Nemotron configuration.</p></div>
+    <div class="sources panel"><div><h3>Repository implementation</h3><ul>
+      <li><a href="https://github.com/Francisco-Reveriano/ASR_Modeling/blob/07b9c21/src/pipeline.py" target="_blank" rel="noopener noreferrer">Live frames, VAD settings and 15-second cap</a></li>
+      <li><a href="https://github.com/Francisco-Reveriano/ASR_Modeling/blob/07b9c21/src/diarization.py" target="_blank" rel="noopener noreferrer">Nemotron windows, speaker cache and turn splitting</a></li>
+      <li><a href="https://github.com/Francisco-Reveriano/ASR_Modeling/blob/07b9c21/src/uploads.py" target="_blank" rel="noopener noreferrer">WAV segmentation and background preparation</a></li>
+      <li><a href="https://github.com/Francisco-Reveriano/ASR_Modeling/blob/07b9c21/tests/test_diarization.py" target="_blank" rel="noopener noreferrer">Streaming timing and cache tests</a></li>
+    </ul></div><div><h3>Primary model references</h3><ul>
+      <li><a href="https://huggingface.co/nvidia/Nemotron-3-Diarization" target="_blank" rel="noopener noreferrer">NVIDIA model card: modes, latency and speaker output</a></li>
+      <li><a href="https://huggingface.co/nvidia/Nemotron-3-Diarization/blob/f667ed73aee57d40cc39428eb768b4fd87a0a29e/processor_config.json" target="_blank" rel="noopener noreferrer">Pinned Nemotron processor configuration</a></li>
+      <li><a href="https://github.com/huggingface/transformers/blob/v5.18.0/src/transformers/models/nemotron3_diarization/processing_nemotron3_diarization.py" target="_blank" rel="noopener noreferrer">Transformers processor: sample-count formulas</a></li>
+      <li><a href="https://github.com/snakers4/silero-vad/blob/master/src/silero_vad/utils_vad.py" target="_blank" rel="noopener noreferrer">Silero implementation: frame size and VADIterator</a></li>
+    </ul><p>The page is self-contained and runs offline. External links open only when you choose them. Changing its controls does not update the application configuration.</p></div></div>
+  </section>
+</main>
+<footer class="footer"><div class="wrap"><span>ASR Modeling · Speech pipeline explainer</span><span>16 kHz timeline · Local VAD &amp; diarization · Source: OpenAI branch</span></div></footer>
+<script>
+(() => {
+  'use strict';
+  const RATE=16000, HOP=160, SUBSAMPLE=8, WIN=400, FFT=512;
+  const modes={low_latency:{chunk:9,right:4},very_low_latency:{chunk:6,right:2},ultra_low_latency:{chunk:3,right:1}};
+  const $=id=>document.getElementById(id);
+  const format=n=>n.toLocaleString('en-US');
+  const svgNS='http://www.w3.org/2000/svg';
+  function svg(parent,tag,attrs,text){const e=document.createElementNS(svgNS,tag);Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,String(v)));if(text!==undefined)e.textContent=text;parent.appendChild(e);return e;}
+  function sizeFor(mode,index){
+    const {chunk,right}=modes[mode],mel=(chunk+right)*SUBSAMPLE,step=chunk*SUBSAMPLE*HOP;
+    const first=(mel-1)*HOP+WIN/2,later=mel*HOP+WIN;
+    const start=index===0?0:index*step-FFT/2;
+    return {first,later,step,start,count:index===0?first:later,scored:step/RATE,look:right*SUBSAMPLE*HOP/RATE,nominal:(chunk+right)*80};
+  }
+  function updateWindow(){
+    const mode=$('mode').value,index=Number($('window').value)-1,m=sizeFor(mode,index),end=m.start+m.count;
+    $('mode-state').textContent=mode==='low_latency'?'App default':'Comparison only';
+    $('window-number').textContent=`${index+1} / 4`;
+    $('raw-samples').textContent=format(m.count);
+    $('raw-duration').textContent=`${(m.count/RATE).toFixed(4).replace(/0$/,'')} s of waveform`;
+    $('scored-duration').textContent=`${Math.round(m.scored*1000)} ms`;
+    $('scored-samples').textContent=`${format(m.step)} samples · ${m.step/HOP} mel frames`;
+    $('lookahead-duration').textContent=`${Math.round(m.look*1000)} ms`;
+    $('nominal-duration').textContent=`Nominal buffer: ${format(m.nominal)} ms`;
+    $('window-title').textContent=`Nemotron ${mode}, window ${index+1}`;
+    const next=(index+1)*m.step-FFT/2;
+    const description=`${index===0?'First':'Later'} call: samples [${format(m.start)}, ${format(end)}). The next call starts at sample ${format(next)}, so lookahead and analysis context are retained.`;
+    $('window-description').textContent=description;
+    $('window-detail').textContent=description;
+    document.querySelectorAll('[data-mode]').forEach(row=>row.classList.toggle('current',row.dataset.mode===mode));
+    const g=$('window-marks');g.replaceChildren();
+    const left=172,right=928,limit=Math.ceil(Math.max(end/RATE,(index+1)*m.scored+m.look)*10)/10+.1;
+    const x=t=>left+t/limit*(right-left);
+    for(let i=0;i<=5;i++){
+      const t=limit*i/5;
+      svg(g,'line',{x1:x(t),x2:x(t),y1:28,y2:192,stroke:'#dfe5df','stroke-width':1});
+      svg(g,'text',{x:x(t),y:217,'text-anchor':'middle',class:'axis'},`${t.toFixed(2)} s`);
+    }
+    svg(g,'text',{x:0,y:66},'Scored timeline');
+    svg(g,'text',{x:0,y:145},'Waveform read');
+    const scoredStart=index*m.scored,scoredEnd=(index+1)*m.scored;
+    if(index>0)svg(g,'rect',{x:x(0),y:43,width:x(scoredStart)-x(0),height:34,rx:5,fill:'#e5ebe4'});
+    svg(g,'rect',{x:x(scoredStart),y:43,width:x(scoredEnd)-x(scoredStart),height:34,rx:5,fill:'#126650'});
+    svg(g,'rect',{x:x(scoredEnd)+1,y:43,width:Math.max(1,x(scoredEnd+m.look)-x(scoredEnd)-1),height:34,rx:5,fill:'#d6ad57'});
+    svg(g,'text',{x:(x(scoredStart)+x(scoredEnd))/2,y:65,'text-anchor':'middle',style:'fill:white;font-size:12px'},`${Math.round(m.scored*1000)} ms`);
+    svg(g,'text',{x:(x(scoredEnd)+x(scoredEnd+m.look))/2,y:65,'text-anchor':'middle',style:'fill:#352807;font-size:12px'},`${Math.round(m.look*1000)} ms`);
+    svg(g,'rect',{x:x(m.start/RATE),y:120,width:x(end/RATE)-x(m.start/RATE),height:34,rx:5,fill:'#295c93'});
+    svg(g,'text',{x:(x(m.start/RATE)+x(end/RATE))/2,y:142,'text-anchor':'middle',style:'fill:white;font-size:12px'},`${format(m.count)} samples`);
+    svg(g,'text',{x:x(m.start/RATE),y:176,class:'axis'},`${(m.start/RATE).toFixed(4)} s`);
+    svg(g,'text',{x:x(end/RATE),y:176,class:'axis','text-anchor':'end'},`${(end/RATE).toFixed(4)} s`);
+  }
+  function updateTurns(){
+    const overlap=$('overlap').checked,g=$('turn-marks');g.replaceChildren();
+    const x=t=>172+t/12*756,colors=['#126650','#295c93','#725395'];
+    for(let i=0;i<=12;i+=2){svg(g,'line',{x1:x(i),x2:x(i),y1:25,y2:210,stroke:'#dfe5df','stroke-width':1});svg(g,'text',{x:x(i),y:235,'text-anchor':'middle',class:'axis'},`${i} s`);}
+    svg(g,'text',{x:0,y:55},'VAD regions');
+    [[.25,5.75],[6.45,11.45]].forEach(([a,b],i)=>{svg(g,'rect',{x:x(a),y:34,width:x(b)-x(a),height:30,rx:5,fill:'#e5ebe4'});svg(g,'text',{x:(x(a)+x(b))/2,y:54,'text-anchor':'middle',style:'font-size:12px'},`Speech region ${i+1}`);});
+    const spans=[[[.4,overlap?3.7:3.2],[6.6,9]],[[3.2,5.6]],[[9,11.3]]];
+    spans.forEach((items,i)=>{const y=86+i*43;svg(g,'text',{x:0,y:y+19},`Speaker ${i+1}`);items.forEach(([a,b])=>svg(g,'rect',{x:x(a),y,width:x(b)-x(a),height:25,rx:4,fill:colors[i]}));});
+    const rows=overlap?[[.25,5.75,'Speaker 1 / Speaker 2'],[6.45,9,'Speaker 1'],[9,11.45,'Speaker 3']]:[[.25,3.2,'Speaker 1'],[3.2,5.75,'Speaker 2'],[6.45,9,'Speaker 1'],[9,11.45,'Speaker 3']];
+    const container=$('turn-rows');container.replaceChildren();
+    rows.forEach(([a,b,speaker],i)=>{const box=document.createElement('div');box.className='turn';const n=document.createElement('div');n.className='number';n.textContent=`ASR ROW ${String(i+1).padStart(2,'0')}`;const title=document.createElement('strong');title.textContent=speaker;const time=document.createElement('span');time.className='mono';time.textContent=`${a.toFixed(2)}–${b.toFixed(2)} s · ${(b-a).toFixed(2)} s`;box.append(n,title,time);container.append(box);});
+    const text=overlap?'The 500 ms overlap exceeds the app’s 250 ms cutoff. The first region keeps a combined label; the second still splits at 9.00 s.':'The first VAD region splits at 3.20 s; the second splits at 9.00 s. Every sample inside each original VAD region is retained exactly once.';
+    $('turn-detail').textContent=text;$('turn-description').textContent=text;
+  }
+  document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{
+    const code=$(button.dataset.copy);
+    try{await navigator.clipboard.writeText(code.textContent);$('copy-status').textContent='Code copied to clipboard.';}
+    catch{const range=document.createRange();range.selectNodeContents(code);const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);$('copy-status').textContent='Code selected. Press Command+C on Mac or Ctrl+C on Windows/Linux to copy.';}
+  }));
+  $('mode').addEventListener('change',updateWindow);$('window').addEventListener('input',updateWindow);$('overlap').addEventListener('change',updateTurns);
+  updateWindow();updateTurns();
+})();
+</script>
+</body>
+</html>

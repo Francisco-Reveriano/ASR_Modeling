@@ -1,5 +1,7 @@
 # Local runtime validation — 2026-10-06
 
+> Historical validation of the earlier Streamlit implementation. The current React/FastAPI migration is documented in [the migration notes](react-fastapi-migration.md); do not interpret the timings below as measurements of the new interface.
+
 Validated on the `OpenAI` branch on the existing Mac, using local model assets.
 Breeze and Tencent retain their shared inference lock. Nemotron runs on its own
 CPU worker. No Hugging Face endpoint or remote model loading was introduced.

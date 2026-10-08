@@ -192,6 +192,7 @@ class LiveTranscriber:
         self._lock = Lock()
         self._input_ended = Event()
         self._finished = Event()
+        self._cancelled = Event()
         self._texts = []
         self._timings = []
         self._diarization = diarization
@@ -222,9 +223,9 @@ class LiveTranscriber:
                 try:
                     for audio in self._resampler.resample(frame):
                         self._feed(audio.to_ndarray().reshape(-1))
-                except Exception as exc:
-                    logger.exception("Audio processing failed")
-                    self._fail(f"Audio processing failed: {exc}")
+                except Exception:
+                    logger.error("Audio processing failed")
+                    self._fail("Audio processing failed. Start a new recording to retry.")
         return frame
 
     def _feed(self, samples):
@@ -364,9 +365,9 @@ class LiveTranscriber:
                 if self._speech_start is not None and not self._input_ended.is_set():
                     self._emit(self._position)
                     self._speech_start = None
-            except Exception as exc:
-                logger.exception("Finishing audio failed")
-                self._fail(f"Finishing audio failed: {exc}")
+            except Exception:
+                logger.error("Finishing audio failed")
+                self._fail("Finishing audio failed. Start a new recording to retry.")
             finally:
                 self._input_ended.set()
                 if self._diarization is not None:
@@ -374,6 +375,25 @@ class LiveTranscriber:
                 if self._worker.ident is None:
                     self._release_capture_audio()
                     self._finished.set()
+
+    def close(self):
+        """Cancel queued audio and discard any result from in-flight inference.
+
+        Model calls cannot safely be interrupted by killing Python threads.
+        The active call may return later, but it can no longer publish text or
+        start another segment. Unlike finish(), this never flushes capture.
+        """
+        with self._lock:
+            self._cancelled.set()
+            self._input_ended.set()
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._pending = 0
+            self._release_capture_audio()
+            if self._worker.ident is None:
+                self._finished.set()
+        if self._diarization is not None:
+            self._diarization.close()
 
     def _run(self):
         """Transcribe queued segments in order until input ends and work drains.
@@ -387,6 +407,8 @@ class LiveTranscriber:
         """
         try:
             while True:
+                if self._cancelled.is_set():
+                    return
                 try:
                     audio, timing = self._queue.get(timeout=0.1)
                 except Empty:
@@ -399,21 +421,27 @@ class LiveTranscriber:
                 try:
                     parts = prepare_speaker_turns(audio, timing, self._diarization)
                     for part in parts:
+                        if self._cancelled.is_set():
+                            return
                         part_timing = {key: value for key, value in part.items() if key != "audio"}
                         part_timing["asr_start_ms"] = monotonic() * 1000
                         text = self._transcribe(part["audio"])
                         part_timing["asr_final_ms"] = monotonic() * 1000
                         with self._lock:
+                            if self._cancelled.is_set():
+                                return
                             if text:
                                 self._texts.append(text)
                                 self._timings.append(part_timing)
                     del parts, part
                     with self._lock:
-                        self._pending -= 1
-                except Exception as exc:
-                    logger.exception("Transcription failed")
+                        self._pending = max(0, self._pending - 1)
+                except Exception:
+                    logger.error("Transcription failed")
                     with self._lock:
-                        self._fail(f"Transcription failed: {exc}. Start a new recording to retry.")
+                        if self._cancelled.is_set():
+                            return
+                        self._fail("Transcription failed. Check the selected ASR model and start a new recording to retry.")
                         while not self._queue.empty():
                             self._queue.get_nowait()
                         self._pending = 0

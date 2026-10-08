@@ -229,9 +229,12 @@ class SpeechSession:
                 self._audio_bytes -= len(pcm)
             self._condition.notify_all()
 
-    def snapshot(self):
+    def snapshot(self, *, consumer=True):
         with self._condition:
-            self._last_poll = monotonic()
+            # Server orchestration observes state independently of the browser.
+            # Only an actual playback consumer keeps the audio lease alive.
+            if consumer:
+                self._last_poll = monotonic()
             return {
                 "session_id": self.session_id, "model": self.model, "sample_rate": SAMPLE_RATE,
                 "chunks": [{"id": i, "pcm": base64.b64encode(pcm).decode("ascii")}

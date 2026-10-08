@@ -1,4 +1,4 @@
-"""Prepare uploaded WAV audio for sequential transcription with local Breeze."""
+"""Prepare uploaded WAV audio for sequential transcription and speaker alignment."""
 
 from io import BytesIO
 from math import gcd
@@ -19,7 +19,7 @@ WAV_BLOCK_FRAMES = 65_536
 
 
 def prepare_speaker_turns_in_background(segment, diarization):
-    """Keep local speaker warmup/alignment off Streamlit's rendering thread."""
+    """Keep local speaker warmup/alignment off the caller's thread."""
     future = Future()
 
     def run():
@@ -35,10 +35,10 @@ def prepare_speaker_turns_in_background(segment, diarization):
 
 
 def transcribe_in_background(transcribe, audio):
-    """Return one reusable decode task while the UI polls completed translations.
+    """Return one reusable decode task while the owner handles other results.
 
-    The upload job retains this Future across Streamlit reruns. Only its owner
-    appends the result, so an interrupted UI run neither repeats ASR nor lets an
+    The upload job retains this Future. Only its owner
+    appends the result, so polling neither repeats ASR nor lets an
     old task write into a replacement session. The ASR callable still acquires
     the shared local-model lock; this worker never loads or calls translators.
     """
